@@ -1,0 +1,107 @@
+<project default="annotate">
+  	<property name="jar" 				value="trishul.jar"/>
+	<property name="annotateJar" 		value="annotations.jar"/>
+	<property name="glibj_zip"			value="../libraries/javalib/external/classpath/lib/glibj.zip"/>
+
+  	<property name="source" 			value="src"/>
+	<property name="lib" 				value="lib"/>
+	<property name="bin" 				value="bin"/>
+	<property name="classes"			value="${bin}/classes"/>
+	<property name="build" 				value="build"/>
+	<property name="buildSrc" 			value="${build}/src"/>
+	<property name="annotateTmp" 		value="${build}/annotate"/>
+	<property name="annotateClasses" 	value="${bin}/annotate"/>
+	<property name="annotations" 		value="annotations"/>
+
+	<target
+		name="init"
+	>
+    	<!-- Create the build directory structure used by compile -->
+    	<mkdir dir="${classes}"/>
+    	<mkdir dir="${buildSrc}"/>
+  	</target>
+
+	<target name="annotate" depends="jar">
+    	<mkdir dir="${annotateTmp}"/>
+    	<mkdir dir="${annotateClasses}"/>
+
+
+    	<path id="annotations.sources">
+			<fileset dir="${annotations}">
+        		<include name="*.java"/>
+      		</fileset>
+    	</path>
+
+    	<pathconvert property="annotations.sources" refid="annotations.sources" pathsep=" "/>
+
+		<java
+			classname="trishul.annotate.Annotate"
+			classpath="${jar}"
+		>
+			<arg line="-d ${annotateTmp} ${annotations.sources}"/>
+		</java>
+
+		<javac
+			srcdir="${annotateTmp}"
+			destdir="${annotateClasses}"
+			classpath="${jar}:${glibj_zip}"
+			debug="on"
+			source="1.5"
+		/>
+
+		<jar
+			destfile="${annotateJar}"
+			basedir="${annotateClasses}"
+		/>
+	</target>
+
+	<!--compilation of the src-dir-->
+	<target name="compile" depends="EnginePolicyParser,JavaParserShared,init">
+		<javac
+			srcdir="${source}:${buildSrc}"
+			destdir="${classes}"
+			debug="on"
+			source="1.5"
+			excludes="trishul_p/polparser/**"
+		>
+		</javac>
+	</target>
+
+	<target name="jar" depends="compile">
+		<jar
+			destfile="${jar}"
+			basedir="${classes}"
+		/>
+	</target>
+
+	<target name="JavaParserShared" depends="init">
+
+		<mkdir dir="${buildSrc}/japa/parser"/>
+
+   		<javacc
+			target="${source}/japa/parser/java_1_5.jj"
+			JavaCCHome="${lib}/javacc-4.0"
+			outputdirectory="${buildSrc}/japa/parser"
+		/>
+
+		<delete file="${buildSrc}/japa/parser/Token.java"/>
+	</target>
+
+	<target name="EnginePolicyParser" depends="init">
+
+		<mkdir dir="${buildSrc}/trishul_p"/>
+
+   		<javacc
+			target="${source}/trishul_p/EnginePolicyParser.jj"
+			JavaCCHome="${lib}/javacc-4.0"
+			outputdirectory="${buildSrc}/trishul_p"
+		/>
+	</target>
+
+	<target name="clean">
+    	<delete dir="${build}"/>
+    	<delete dir="${bin}"/>
+    	<delete file="${jar}"/>
+    	<delete file="${annotateJar}"/>
+	</target>
+</project>

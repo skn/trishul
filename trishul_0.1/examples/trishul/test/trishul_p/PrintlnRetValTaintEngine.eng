@@ -1,0 +1,22 @@
+package trishul.test.trishul_p;
+import trishul_p.*;
+
+public class PrintlnRetValTaintEngine
+extends Engine
+{
+  	public Order query (Action a)
+  	{
+    	aswitch(a)
+    	{
+      	case <* trishul.test.trishul_p.TestGeneric.getString(..)>:
+	      	return new RetValTaintOrder (new Taint (Taint.TAINT_OBJECT, 4));
+      	case <* trishul.test.trishul_p.TestGeneric.getInt(..)>:
+	      	return new RetValTaintOrder (new Taint (Taint.TAINT_PRIMITIVE, 3));
+      	case <* *.*.println(..#<3>)>:
+	      	return new OKOrder ();
+      	case <* *.*.println(..#<4>)>:
+	      	return new SuppressOrder ();
+    	}
+    	return null;
+  	}
+}

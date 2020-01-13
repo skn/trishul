@@ -1,0 +1,23 @@
+jrelibdir = @jrelibdir@
+ANT=ant$(shell if [ `ant -version | awk '{print $$4}'` = "1.6.2" ]; then echo " -lib lib/ant-1.6.2"; elif [ `ant -version | awk '{print $$4}'` = "1.6.5" ]; then echo " -lib lib/ant-1.6.5"; fi)
+KEYSTORE_PASSWORD=@TRISHUL_KEYSTORE_PASS@
+ifdef KEYSTORE_PASSWORD
+PASSWORD_PARAM=-storepass $(KEYSTORE_PASSWORD)
+endif
+KEYSTORE=@TRISHUL_KEYSTORE@
+
+all:
+	$(ANT)
+	jarsigner -keystore $(KEYSTORE) $(PASSWORD_PARAM) trishul.jar @TRISHUL_KEYSTORE_ALIAS@
+	jarsigner -keystore $(KEYSTORE) $(PASSWORD_PARAM) annotations.jar @TRISHUL_KEYSTORE_ALIAS@
+
+clean:
+	$(ANT) clean
+
+distclean: clean
+	rm -f Makefile
+
+install: all
+	cp trishul.jar ${jrelibdir}
+	cp annotations.jar ${jrelibdir}
+	

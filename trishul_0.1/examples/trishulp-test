@@ -1,0 +1,10 @@
+#! /bin/sh
+
+OUTPUT=$1
+ENGINE=`dirname $OUTPUT`/`basename $OUTPUT .out`
+POLYMER_TEST_TMP=$2
+
+echo '  '$ENGINE
+./kaffe-tst -Xtaintdebuglevel 0  -Xengine $ENGINE trishul/test/trishul_p/TestGeneric >$POLYMER_TEST_TMP 2>&1
+diff $POLYMER_TEST_TMP $OUTPUT
+

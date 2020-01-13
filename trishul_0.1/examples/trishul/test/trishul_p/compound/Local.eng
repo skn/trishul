@@ -1,0 +1,21 @@
+package trishul.test.trishul_p.compound;
+
+import trishul_p.*;
+
+public class Local
+extends Engine
+{
+	private LocalExtension ext = new LocalExtension ();
+
+	public Order query (Action a)
+  	{
+  		aswitch (a)
+  		{
+  		case <* java.io.PrintStream.println (String)>:
+  			ext.run ();
+  			return new ReplaceOrder (null);
+  		}
+      	return null;
+    }
+}
+

@@ -1,0 +1,18 @@
+package trishul.test.trishul_p;
+import trishul_p.*;
+
+public class TestPatternParamTaintEngine
+extends Engine
+{
+  	public Order query (Action a)
+  	{
+    	aswitch(a)
+    	{
+      	case <* trishul.test.trishul_p.TestGeneric.passString(..)>:
+	      	return new ParamTaintOrder (0, new Taint (Taint.TAINT_OBJECT, 7));
+      	case <* *.*.testParams(int,java.lang.String#<7>)>:
+	      	return new SuppressOrder ();
+    	}
+    	return null;
+  	}
+}

@@ -1,0 +1,14 @@
+#! /bin/sh
+
+#OPT="-source 1.5"
+
+while [ $# -gt 1 ]; do
+	OPT="$OPT $1";
+	shift 1
+done
+
+BASENAME=`dirname $1`/`basename $1 .java`
+BPC=../kaffe-1.1.7/libraries/javalib/external/classpath/lib/glibj.zip:../kaffe-1.1.7/trishul/trishul.jar
+#BPC=.
+jikes -bootclasspath $BPC $OPT $1 && javap -c $BASENAME >$BASENAME.jdasm
+#javac -bootclasspath  $BPC $OPT $1 && javap -c $BASENAME >$BASENAME.jdasm

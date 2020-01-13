@@ -1,0 +1,356 @@
+// 
+options {
+  LOOKAHEAD=1;
+  STATIC=false;
+  CACHE_TOKENS=true;
+  ERROR_REPORTING = true;
+  JAVA_UNICODE_ESCAPE=false;
+  UNICODE_INPUT=true;
+  DEBUG_PARSER=false;
+  DEBUG_LOOKAHEAD=false;
+  DEBUG_TOKEN_MANAGER=false;
+}
+
+PARSER_BEGIN(EnginePolicyParser)
+package trishul_p;
+import java.io.*;
+import java.lang.reflect.*;
+import java.net.*;
+import java.security.*;
+
+final public class EnginePolicyParser
+{
+	private trishul_p.EnginePolicyURL policy;
+
+	public EnginePolicyParser (URL url, InputStream in, trishul_p.EnginePolicyURL policy)
+	throws ParseException
+	{
+		this (in);
+		this.policy = policy;
+		ParsePolicy ();
+	}
+
+	private class ParseException
+	extends trishul_p.ParseException
+	{
+ 		public ParseException (Token currentTokenVal,
+                        	   int[][] expectedTokenSequencesVal,
+                        	   String[] tokenImageVal)
+  		{
+    		super (currentTokenVal, expectedTokenSequencesVal, tokenImageVal);
+  		}
+
+  		public ParseException ()
+  		{
+    		super();
+ 		}
+
+  		public ParseException (Token currentTokenVal, String message)
+  		{
+    		super (message);
+    		currentToken = currentTokenVal;
+  		}
+
+  		public ParseException (Token currentTokenVal, String message, Throwable e)
+  		{
+    		super (message);
+    		initCause (e);
+    		currentToken = currentTokenVal;
+  		}
+  	}
+}
+
+PARSER_END(EnginePolicyParser)
+
+/* WHITE SPACE */
+
+SKIP :
+{
+  " "
+| "\t"
+| "\n"
+| "\r"
+| "\f"
+}
+
+/* COMMENTS */
+
+MORE :
+{
+  "//" : IN_SINGLE_LINE_COMMENT
+|
+  <"/**" ~["/"]> { input_stream.backup(1); } : IN_FORMAL_COMMENT
+|
+  "/*" : IN_MULTI_LINE_COMMENT
+}
+
+<IN_SINGLE_LINE_COMMENT>
+SPECIAL_TOKEN :
+{
+  <SINGLE_LINE_COMMENT: "\n" | "\r" | "\r\n" > : DEFAULT
+}
+
+<IN_FORMAL_COMMENT>
+SPECIAL_TOKEN :
+{
+  <FORMAL_COMMENT: "*/" > : DEFAULT
+}
+
+<IN_MULTI_LINE_COMMENT>
+SPECIAL_TOKEN :
+{
+  <MULTI_LINE_COMMENT: "*/" > : DEFAULT
+}
+
+<IN_SINGLE_LINE_COMMENT,IN_FORMAL_COMMENT,IN_MULTI_LINE_COMMENT>
+MORE :
+{
+  < ~[] >
+}
+
+/* RESERVED WORDS AND LITERALS */
+
+TOKEN :
+{
+  < GRANT: "grant" >
+| < KEYSTORE: "keystore" >
+| < SIGNEDBY: "signedBy" >
+| < CODEBASE: "codeBase" >
+| < PRINCIPAL: "principal" >
+| < PERMISSION: "permission" >
+}
+
+/* LITERALS */
+
+TOKEN :
+{
+  < STRING_LITERAL:
+      "\""
+      (   (~["\"","\\","\n","\r"])
+        | ("\\"
+            ( ["n","t","b","r","f","\\","'","\""]
+            | ["0"-"7"] ( ["0"-"7"] )?
+            | ["0"-"3"] ["0"-"7"] ["0"-"7"]
+            )
+          )
+        | ("\\u"
+        	["0"-"9","A"-"F","a"-"f"]
+        	["0"-"9","A"-"F","a"-"f"]
+        	["0"-"9","A"-"F","a"-"f"]
+        	["0"-"9","A"-"F","a"-"f"]
+          )
+      )*
+      "\""
+      |
+      "'"
+      (   (~["'","\\","\n","\r"])
+        | ("\\"
+            ( ["n","t","b","r","f","\\","'","\""]
+            | ["0"-"7"] ( ["0"-"7"] )?
+            | ["0"-"3"] ["0"-"7"] ["0"-"7"]
+            )
+          )
+        | ("\\u"
+        	["0"-"9","A"-"F","a"-"f"]
+        	["0"-"9","A"-"F","a"-"f"]
+        	["0"-"9","A"-"F","a"-"f"]
+        	["0"-"9","A"-"F","a"-"f"]
+          )
+      )*
+      "'"
+  >
+}
+
+/* IDENTIFIERS */
+
+TOKEN :
+{
+  < IDENTIFIER: <LETTER> (<LETTER>|<DIGIT>|["."])* >
+|
+  < #LETTER:
+      [
+       "\u0024",
+       "\u0041"-"\u005a",
+       "\u005f",
+       "\u0061"-"\u007a",
+       "\u00c0"-"\u00d6",
+       "\u00d8"-"\u00f6",
+       "\u00f8"-"\u00ff",
+       "\u0100"-"\u1fff",
+       "\u3040"-"\u318f",
+       "\u3300"-"\u337f",
+       "\u3400"-"\u3d2d",
+       "\u4e00"-"\u9fff",
+       "\uf900"-"\ufaff"
+      ]
+  >
+|
+  < #DIGIT:
+      [
+       "\u0030"-"\u0039",
+       "\u0660"-"\u0669",
+       "\u06f0"-"\u06f9",
+       "\u0966"-"\u096f",
+       "\u09e6"-"\u09ef",
+       "\u0a66"-"\u0a6f",
+       "\u0ae6"-"\u0aef",
+       "\u0b66"-"\u0b6f",
+       "\u0be7"-"\u0bef",
+       "\u0c66"-"\u0c6f",
+       "\u0ce6"-"\u0cef",
+       "\u0d66"-"\u0d6f",
+       "\u0e50"-"\u0e59",
+       "\u0ed0"-"\u0ed9",
+       "\u1040"-"\u1049"
+      ]
+  >
+}
+
+TOKEN:
+{
+	< URL:
+		<IDENTIFIER> ":" ~[" ","\t","\r","\n","\"","'"]
+	>
+}
+
+void ParsePolicy():
+{
+}
+{
+	(
+		Keystore()
+		|
+		Grant()
+	)+
+}
+
+
+void Keystore():
+{
+	Token	algorithm;
+	Token	url;
+}
+{
+	<KEYSTORE>
+	url=<URL>
+	[
+		","
+		algorithm=<IDENTIFIER>
+	]
+	";"
+}
+
+
+void Grant():
+{
+	EnginePolicyURL.Grant 	grant;
+	Permission				perm;
+}
+{
+	<GRANT>											{grant = policy.new Grant ();}
+	(
+		(GrantParameter(grant))*
+	)
+	"{"
+		(
+			perm=Permission()						{grant.addPermission (perm);}
+		)+
+	"}"
+	";"												{policy.addGrant (grant);}
+}
+
+void GrantParameter(EnginePolicyURL.Grant grant):
+{
+	Token codeBase;
+	String signer;
+	Token principalType = null;
+	String principalName;
+}
+{
+	<SIGNEDBY>	signer=StringLiteral()				{grant.addSigner (signer);}
+	|
+	<CODEBASE>	codeBase=<URL>						{
+														try
+														{
+															grant.setCodeBase (new URL (codeBase.image));
+														}
+														catch (MalformedURLException e)
+														{
+															throw new ParseException (codeBase, e.getMessage (), e);
+														}
+													}
+	|
+	<PRINCIPAL>
+	[principalType=<IDENTIFIER>]
+	principalName=StringLiteral()					{grant.addPrincipal (principalType == null ? null
+																							   : principalType.image,
+																							   principalName);}
+}
+
+Permission Permission():
+{
+	Token		permType;
+	String		target = null, action = null;
+}
+{
+	<PERMISSION>
+	permType=<IDENTIFIER>
+	[
+		target=StringLiteral()
+		[
+			","
+			action=StringLiteral()
+		]
+	]
+	";"
+
+		{
+			java.security.cert.Certificate[] certs = null; // TODO: implement
+			Object[]	params;
+
+			try
+			{
+				Class permClass = Class.forName (permType.image);
+				Class[]	paramsClasses;
+				if (target == null)
+				{
+					paramsClasses = new Class[] 	{};
+					params		  = new Object[]	{};
+				}
+				else if (action == null)
+				{
+					paramsClasses = new Class[] 	{String.class};
+					params		  = new Object[]	{target};
+				}
+				else
+				{
+					paramsClasses = new Class[] 	{String.class, String.class};
+					params		  = new Object[]	{target, action};
+				}
+
+				try
+				{
+					Constructor<Permission> ctor = permClass.getConstructor (paramsClasses);
+                	return (Permission) ctor.newInstance (params);
+                }
+                catch (Exception e)
+                {
+                	throw new ParseException (permType, e.getMessage (), e);
+                }
+			}
+			catch (ClassNotFoundException e)
+			{
+                	e.printStackTrace ();
+				return new UnresolvedPermission (permType.image, target, action, certs);
+			}
+		}
+}
+
+String StringLiteral():
+{
+	Token token;
+}
+{
+	token=<STRING_LITERAL>
+		{return token.image.substring (1, token.image.length () - 1);}
+}

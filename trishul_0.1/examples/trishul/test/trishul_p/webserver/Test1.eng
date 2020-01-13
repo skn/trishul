@@ -1,0 +1,93 @@
+package trishul.test.trishul_p.webserver;
+
+import trishul_p.*;
+import java.io.File;
+import java.net.*;
+
+public class Test1
+extends Engine
+{
+   private enginetaint accessClass
+   {
+      dummyTaint, localAccess,globalIP
+   }
+
+	public Order query (Action a)
+    {
+        aswitch(a)
+        {
+        case <* *.Socket.getOutputStream(..)>:
+			Socket s = (java.net.Socket)(a.getThisPointer());
+			System.out.println("Remote IP: " + s.getInetAddress().toString());//assume all are non-local for now
+			return new RetValTaintOrder (#object:{globalIP});
+		case <* java.io.FileInputStream.<init>(..,File f)>:
+			if(f.getName().indexOf ("onlylocal") >= 0) //this can only be served to local clients
+			{
+				System.out.println("Accessing local-only file");
+				return new ObjectTaintOrder (a.getThisPointer(),#object:{localAccess});
+			}
+			return null;
+		case <* *.PrintStream#<{globalIP}>.write(..#<{localAccess}>)>:
+			System.out.println("ohohhh!");
+			return null;
+		case <* *.Response#<{localAccess}>.write(..)>:
+			System.out.println("TAINTED WRITE");
+			return null;
+		case <* *.Output#<{localAccess}>.finish()>:
+			System.out.println("TAINTED OUTPUT");
+			return null;
+		case <* *.Server.setRequestProperties(*,*,*#<{localAccess}>)>:
+			System.out.println("TAINTED setRequestProperties");
+			return null;
+		case <* *.Server.handleRequest(..#<{localAccess}>)>:
+			System.out.println("HANDLE");
+			return null;
+		case <* *.Server.dummy(*#<{localAccess}>, String s)>:
+			System.out.println("TAINTED DUMMY: " + s);
+			return null;
+		case <* *.Server.dummy(String s)#<{localAccess}>>:
+			System.out.println("TAINTED CONTEXT: " + s);
+			return null;
+
+		case <* *.PlainSocketImpl$SocketInputStream.read(byte[])#<{localAccess}>>:
+			System.out.println ("TAINTED SOCKET READ1A");
+			return null;
+
+		case <* *.PlainSocketImpl$SocketInputStream.read(byte[],int,int)#<{localAccess}>>:
+			System.out.println ("TAINTED SOCKET READ1B");
+			return null;
+
+		case <* *.PlainSocketImpl$SocketInputStream.read(..)>:
+			System.out.println ("UNTAINTED SOCKET READ1");
+			return null;
+
+		case <* *.PlainSocketImpl.read(..)#<{localAccess}>>:
+			System.out.println ("TAINTED SOCKET READ2");
+			return null;
+
+		case <* *.InputStreamReader.<init>(..#<{localAccess}>)>:
+			System.out.println ("TAINTED INPUSTREAMREADER CTOR");
+			return null;
+
+		case <* *.InputStreamReader.read(..)#<{localAccess}>>:
+			System.out.println ("TAINTED INPUSTREAMREADER READ");
+			return null;
+
+		case <* *.EncodingHelper.getCharset(String s)#<{localAccess}>>:
+			System.out.println ("TAINTED EncodingHelper.getCharset: " + s);
+			return null;
+
+		case <* *.Charset.newDecoder()#<{localAccess}>>:
+			System.out.println ("TAINTED Charset.newDecoder");
+			return null;
+
+
+		case <* *.PlainSocketImpl$SocketInputStream.<init>(..#<{localAccess}>)>:
+			System.out.println ("TAINTED SOCKET CTOR");
+			return null;
+
+		}
+		return null;
+	}
+
+}

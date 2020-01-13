@@ -1,0 +1,37 @@
+package trishul.test.trishul_p;
+import trishul_p.*;
+
+public class PrintlnInsEngine
+extends Engine
+{
+	boolean first = true;
+
+	public Order query (Action a)
+	{
+		aswitch(a)
+		{
+		case <* *.*.println(..)>: if (first) return new InsertOrder(
+						new ConcreteAction (this, "trishul.test.trishul_p.PrintlnInsEngine.test(java.lang.String,int)",
+						new Object[] {"Inserted string", new Integer (9)}), this);
+			break;
+		}
+		return null;
+	}
+
+	private double test (String s, int i)
+	{
+		System.out.print (s);
+		System.out.print (": ");
+		System.out.print (i);
+		System.out.print ("\n");
+		first = false;
+		return 3.14159;
+	}
+
+	public void handleResult (Action action, Order s, Object result, boolean wasExnThn)
+	{
+		System.out.print ("HANDLE " + (wasExnThn ? "EXCEPTION" : "NORMAL") + " -> " + result + "\n");
+	}
+
+
+}

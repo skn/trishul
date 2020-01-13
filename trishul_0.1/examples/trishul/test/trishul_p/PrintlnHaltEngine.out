@@ -1,0 +1,3 @@
+Halting target ; no printlns allowed!
+trishul_p.HaltException
+   at trishul.test.trishul_p.TestGeneric.main (TestGeneric.java:65)

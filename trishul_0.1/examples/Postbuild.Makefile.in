@@ -1,0 +1,11 @@
+all:
+	echo all
+
+clean:
+	echo clean
+
+install:
+	echo install
+
+distclean:
+	echo distclean

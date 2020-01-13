@@ -1,0 +1,2 @@
+#!/bin/sh
+./configure CFLAGS="-g -O3" --with-staticvm --with-staticbin --disable-vmdebug --with-trishul-keystore=trishul.keystore --with-trishul-keystore-alias=trishul --with-trishul-keystore-password=trishul $*

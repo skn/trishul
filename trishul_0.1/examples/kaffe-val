@@ -1,0 +1,36 @@
+#!/bin/sh
+
+ROOT=../kaffe-1.1.7
+
+KAFFELIBRARYPATH="$ROOT/kaffe/kaffeh/.libs:\
+$ROOT/kaffe/kaffevm/jni/.libs:\
+$ROOT/kaffe/kaffevm/kaffe-gc/.libs:\
+$ROOT/kaffe/kaffevm/intrp/.libs:\
+$ROOT/kaffe/kaffevm/verifier/.libs:\
+$ROOT/kaffe/kaffevm/systems/unix-pthreads/.libs:\
+$ROOT/kaffe/kaffevm/.libs:\
+$ROOT/kaffe/kaffe/.libs:\
+$ROOT/libraries/javalib/external/classpath/native/fdlibm/.libs:\
+$ROOT/libraries/javalib/external/classpath/native/jni/classpath/.libs:\
+$ROOT/libraries/javalib/external/classpath/native/jni/gtk-peer/.libs:\
+$ROOT/libraries/clib/native/.libs:\
+$ROOT/libraries/clib/io/.libs:\
+$ROOT/libraries/clib/nio/.libs:\
+$ROOT/libraries/clib/net/.libs:\
+$ROOT/libraries/clib/zip/.libs:\
+$ROOT/libraries/clib/math/.libs:\
+$ROOT/libraries/clib/security/.libs:\
+$ROOT/libraries/clib/management/.libs:\
+$ROOT/external/gcc/zlib/.libs:\
+$ROOT/external/gcc/fastjar/.libs:\
+$ROOT/replace/.libs:\
+$ROOT/libltdl/.libs"
+
+export KAFFELIBRARYPATH
+export LD_LIBRARY_PATH="$KAFFELIBRARYPATH"
+
+export BOOTCLASSPATH=".:$ROOT/tools/javatools/javalib/tools.jar:$ROOT/libraries/javalib/external/classpath/lib/glibj.zip"
+
+valgrind --error-limit=no -q  --log-file-exactly=valgrind.log --tool=memcheck --show-reachable=yes $ROOT/kaffe/kaffe/kaffe-bin $*
+
+

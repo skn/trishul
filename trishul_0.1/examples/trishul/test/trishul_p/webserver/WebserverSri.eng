@@ -1,0 +1,88 @@
+package trishul.test.trishul_p.webserver;
+
+import trishul_p.*;
+import java.io.File;
+import java.net.*;
+
+public class WebserverSri
+extends Engine
+{
+	private enginetaint accessClass
+	{
+		// Loads of bogus flags included to make OutsideRoot a number that does not occur normally in the logs
+		localAccess,globalAccess,localIP,globalIP,a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,OutsideRoot
+        }
+
+	public Order query (Action a)
+    	{
+	accessClass myLevels = #{localAccess,globalAccess,localIP,globalIP,OutsideRoot};
+	aswitch(a)
+	{
+		case <* *.Socket.getOutputStream(..)>:
+			Socket s= (java.net.Socket)(a.getThisPointer());
+			InetAddress addr = s.getInetAddress();
+			System.out.println("\n*** New Request ***");
+			System.out.println("Remote IP: " + addr.toString());//assume all are non-local for now
+			if (!addr.isLoopbackAddress()) {
+				System.out.println("IP is _not_ local");
+				//return new ObjectTaintOrder (a.getThisPointer(),#object:{globalIP});
+				return new RetValTaintOrder (#auto:{globalIP});
+			}
+			System.out.println("IP _is_ local");
+			break;
+		case <* java.io.FileInputStream.<init>(File f)>:
+			try {
+				System.out.println("Accessing file " + f.getCanonicalPath());
+
+				/* Taint files which are meant for local access
+				*/
+				if(f.getName().indexOf ("onlylocal") >= 0) {
+	                        	System.out.println("Accessing local-only file");
+					return new ObjectTaintOrder (a.getThisPointer(),#object:{localAccess});
+				}
+				/* Taint access outside DocumentRoot directory.
+				   For best security full path should be given.
+				   But for testing a more relaxed check is made.
+				*/
+
+				if((f.getCanonicalPath().indexOf("/webserver/www") < 0) &&
+					(f.getCanonicalPath().indexOf("/webserver/bin/") < 0))
+				{
+					if (f.getCanonicalPath().indexOf("/etc/timezone") >= 0 &&
+						a.getContext ().equals ("java.util.VMTimeZone.readTimeZoneFile"))
+					{
+						return null;
+					}
+					else if (f.getCanonicalPath().indexOf("mime.types") >= 0 &&
+							 a.getContext (1).equals ("Server.<init>"))
+					{
+						return null;
+					}
+
+					System.out.println("File outside document root dir - " + f.getCanonicalFile());
+					return new ObjectTaintOrder (a.getThisPointer(),#object:{OutsideRoot});
+				}
+			}
+			catch (Exception e){
+				System.out.println("Exception occured!");
+				e.printStackTrace ();
+			}
+			break;
+		case <* java.io.PrintStream.<init>(..#<{globalIP}>)>:
+                        System.out.println("Printstream init tainted with globalIP");
+			break;
+		case <* *.PrintStream#<{globalIP}>.write(..#<{localAccess}>)>:
+			System.out.println("== Forbidden access of local file using nonlocalIP ==");
+			return new SuppressOrder();
+			//break;
+		case <* *.PrintStream.write(byte[] b#<{OutsideRoot}>, int, int)>:
+			System.out.println("== Forbidden access of file outside documentroot ==");
+			System.out.println (new String (b));
+			return new SuppressOrder();
+			//break;
+	}
+	return null;
+	//new UnregOrder(this,a); <--- doesn't work
+	}
+}
+

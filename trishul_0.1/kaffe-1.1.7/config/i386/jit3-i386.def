@@ -1,0 +1,4713 @@
+/* jit3-i386.def
+ * i386 instruction definition.
+ *
+ * Copyright (c) 1996, 1997
+ *	Transvirtual Technologies, Inc.  All rights reserved.
+ *
+ * Cross-language profiling changes contributed by
+ * the Flux Research Group, Department of Computer Science,
+ * University of Utah, http://www.cs.utah.edu/flux/
+ *
+ * See the file "license.terms" for information on usage and redistribution
+ * of this file.
+ */
+
+#include "debug.h"
+#include "classMethod.h"
+#include "md.h"
+#include "xprofiler.h"
+#include "trishul.h"
+#include "polymer.h"
+#include "utils.h"
+
+enum {PUSHALL_SIZE			= 8 * 4};
+enum {POLYMER_RETVAL_SIZE 	= 8};
+
+#define TRAP_BREAK		1
+#define TRAP_DUMPREGS	2
+
+#define TRAP_DEBUG			TRAP_DUMPREGS
+#define TRAP_PROLOGUE		0
+#define TRAP_STACK_LIMIT	TRAP_BREAK
+#define TRAP_CALL_REF		0
+#define TRAP_CALL			0
+#define TRAP_RETURN			0
+#define TRAP_POPARGS		0
+#define TRAP_COMBINE		0
+#define TRAP_PROPAGATE		0
+#define TRAP_POLYMER_UPDATE	0
+#define TRAP_POLYMER		0
+#define TRAP_POLYMER_CALL	0
+#define TRAP(X) if (TRAP_##X) {if (TRAP_##X == TRAP_DUMPREGS) DUMPXMM(); OUT(0xCC); debug (("TRAP "#X"\n"));}
+
+#define OFFSET_MEMBER_TAINT ((int) &((Hjava_lang_Object*) NULL)->member_taint)
+#define OFFSET_OBJECT_TAINT ((int) &((Hjava_lang_Object*) NULL)->obj_taint)
+
+extern void polymerCheckFiltersWrapper (void);
+
+
+typedef unsigned long long XMMREG[2];
+static XMMREG xmm[8];
+
+static void DUMPXMM ()
+{
+	uint i;
+	for (i = 0; i < 8; i++)
+	{
+		OUT (0xF3); OUT (0x0F); OUT (0x7F); OUT (0x05 | (i << 3)); LOUT ((uint) xmm[i]);
+	}
+}
+
+void DUMPXMMRT ()
+{
+	asm ("movdqu %%xmm0, %0" : : "m" (xmm[0][0]));
+	asm ("movdqu %%xmm1, %0" : : "m" (xmm[1][0]));
+	asm ("movdqu %%xmm2, %0" : : "m" (xmm[2][0]));
+}
+
+/* Reg layout (3 / reg):
+ *  0 - 2 - General registers
+ *  3 - 6 - FP/MMX
+ *  7 - Scratch for store/loads & calculations
+ * There are 3 general registers per xmm, so that the highest part is always 0. This allows combinations to be
+ * executed easily: using pshufd the required src is moved into dst's location in scratch, with the rest
+ * using the highest 0 part. Then, only a por is needed
+ *
+ * Detailed regs
+ * 0 - 0, 1, 2  	(EAX, ECX, EDX)
+ * 1 - 3, 4, 5  	(EBX, ESP, EBP)
+ * 2 - CTX, 6, 7	(Context taint, ESI, EDI)
+ * 3 - FP0, FP1
+ * 4 - FP2, FP3
+ * 5 - FP4, FP5
+ * 6 - FP6, FP7
+ * 7 - Scratch
+ */
+
+typedef struct
+{
+	uint xmmReg;
+	uint part;
+} TaintRegister;
+#define XMM_SCRATCH				7
+#define XMM_SCRATCH_ASM  		"%xmm7"
+static const TaintRegister XMM_SCRATCH_PART0 = {XMM_SCRATCH, 0};
+static const TaintRegister TAINT_REGS[16] =
+{
+	{0, 0}, {0, 1}, {0, 2}, {1, 0}, {1, 1}, {1, 2}, {2, 1}, {2, 2},
+	{3, 0}, {3, 1}, {3, 2}, {4, 0}, {4, 1}, {4, 2}, {5, 0}, {5, 1},
+};
+
+static const TaintRegister TAINT_CONTEXT = {2, 0};
+static const TaintRegister TAINT_NOTHROW = {4, 0};
+
+
+typedef enum
+{
+	REG_eax,
+	REG_ecx,
+	REG_edx,
+	REG_ebx,
+	REG_esp,
+	REG_ebp,
+	REG_esi,
+	REG_edi,
+	REG_flt0,
+
+	NOREGISTER = 9
+} Register;
+#define	REG_dbl0	REG_flt0
+
+/* If a valid register is stored in this variable, it can be used as a scratch register, as the owner allocated
+ * it as a temporary and stored it, but did not yet use it. This prevents double stores in the case of array and
+ * object taints.
+ */
+static Register allowedTemporary = NOREGISTER;
+
+enum
+{
+	FLAG_IS_INDIRECT	= 1,
+	FLAG_HAVE_SIB		= 3, // Includes FLAG_IS_INDIRECT
+	FLAG_IS_CONSTANT	= 4,
+	FLAG_IS_FIXED		= 9, // Includes FLAG_IS_INDIRECT
+	FLAG_IS_TAINT		= 16,
+};
+
+typedef struct
+{
+	uint		flags;
+	union
+	{
+		struct
+		{
+			Register	reg;
+			int			disp;
+
+			Register	index;
+			uint		scale;
+		};
+
+		const TaintRegister *taint;
+	};
+} RegMem;
+
+
+static inline bool regMemIsIndirect (const RegMem *rm) 	{return (rm->flags & FLAG_IS_INDIRECT) == FLAG_IS_INDIRECT;}
+static inline bool regMemHasSIB 	(const RegMem *rm) 	{return (rm->flags & FLAG_HAVE_SIB)    == FLAG_HAVE_SIB;}
+static inline bool regMemIsConstant (const RegMem *rm) 	{return (rm->flags & FLAG_IS_CONSTANT) == FLAG_IS_CONSTANT;}
+static inline bool regMemIsFixed	(const RegMem *rm) 	{return (rm->flags & FLAG_IS_FIXED)    == FLAG_IS_FIXED;}
+static inline bool regMemIsTaint	(const RegMem *rm) 	{return (rm->flags & FLAG_IS_TAINT)    == FLAG_IS_TAINT;}
+
+static const RegMem REGISTER_RM[16] =
+{
+	{0, {{0, 0, 0, 1}}}, 	{0, {{1, 0, 0, 1}}}, 	{0, {{2, 0, 0, 1}}}, 	{0, {{3, 0, 0, 1}}},
+	{0, {{4, 0, 0, 1}}}, 	{0, {{5, 0, 0, 1}}}, 	{0, {{6, 0, 0, 1}}}, 	{0, {{7, 0, 0, 1}}},
+	{0, {{8, 0, 0, 1}}}, 	{0, {{9, 0, 0, 1}}}, 	{0, {{10, 0, 0, 1}}}, 	{0, {{11, 0, 0, 1}}},
+	{0, {{12, 0, 0, 1}}}, 	{0, {{13, 0, 0, 1}}}, 	{0, {{14, 0, 0, 1}}}, 	{0, {{15, 0, 0, 1}}},
+};
+
+static inline RegMem GetRegMemFull (uint flags, Register reg, int disp, Register index, uint scale)
+{
+	RegMem rm;
+	rm.flags	= flags;
+	rm.reg		= reg;
+	rm.disp		= disp;
+	rm.index	= index;
+	rm.scale	= scale;
+	return rm;
+}
+
+static inline RegMem GetRegMem (Register reg, int disp, uint flags)
+{
+	return GetRegMemFull (flags, reg, disp, 0, 1);
+}
+
+static inline RegMem GetRegMemSIB (uint scale, Register index, Register base)
+{
+	assert (scale == 1 || scale == 2 || scale == 4 || scale == 8);
+	return GetRegMemFull (FLAG_HAVE_SIB, base, 0, index, scale);
+}
+
+static inline RegMem GetConstantRM (int constant)
+{
+	return GetRegMemFull (FLAG_IS_CONSTANT, NOREGISTER, constant, NOREGISTER, 0);
+}
+
+static inline RegMem GetFixedRM (void *addr)
+{
+	return GetRegMemFull (FLAG_IS_FIXED, NOREGISTER, (int) addr, NOREGISTER, 0);
+}
+
+#define GetLocalRM(disp)	GetRegMem (REG_ebp, (disp), FLAG_IS_INDIRECT)
+#define GetStackRM(disp) 	GetRegMem (REG_esp, (disp), FLAG_IS_INDIRECT)
+#define GetRegisterRM(reg)	REGISTER_RM[reg]
+#define GetDispRM(reg,disp)	GetRegMem (reg, disp, FLAG_IS_INDIRECT)
+#define GetContextOffset(part)	(-4 - (part) * sizeof (taint_t))
+#define GetContextRM(part)	GetLocalRM (GetContextOffset (part))
+
+static inline RegMem GetTaintRM (const TaintRegister *taint)
+{
+	RegMem rm;
+	rm.flags = FLAG_IS_TAINT;
+	rm.taint = taint;
+	return rm;
+}
+
+static const RegMem RM_TAINT_CONTEXT = {FLAG_IS_TAINT, {{(Register) &TAINT_CONTEXT, 0, 0, 0}}};
+static const RegMem RM_TAINT_NOTHROW = {FLAG_IS_TAINT, {{(Register) &TAINT_NOTHROW, 0, 0, 0}}};
+static const RegMem RM_NULL 		 = {FLAG_IS_CONSTANT, {{0, 0, 0, 0}}};
+
+/**
+ * Combines two taints into dst.
+ */
+static void genTaintCombine (const RegMem src, RegMem dst);
+static void genTaintCombine3 (RegMem src1, RegMem src2, RegMem dst);
+
+/**
+ * Moves taint from src to dst.
+ */
+static void genTaintPropagate (RegMem src, RegMem dst);
+static void genTaintPropagate3 (RegMem src1, RegMem src2, RegMem dst);
+
+/**
+ * Stores/loads the taint associated with 'tainted' into the storage location.
+ */
+static void genTaintStore (const RegMem *tainted, taint_t *store);
+static void genTaintLoad (taint_t *store, const RegMem *tainted);
+
+/**
+ * Clears the register's taint
+ */
+static void genClearTaint (Register reg);
+
+/**
+ * Spill's the register's taint into local variable at offset
+ */
+static void genTaintRegSpill (Register reg, int offset);
+
+/**
+ * Reload the register's taint from EBP(offset)
+ */
+static void genTaintRegReload (Register reg, int offset);
+
+static void genTaintRegPush (Register reg);
+static void genTaintTaintRegPush (const TaintRegister *xmm);
+static void genTaintRegPop (Register reg);
+static void genTaintTaintRegPop (const TaintRegister *xmm);
+
+static void genTaintXMM2Stack 	(const TaintRegister *xmm);
+static void genTaintXMM2RM		(const TaintRegister *xmm, const RegMem *rmDst);
+static void genTaintWorking2XMM (const RegMem *rmSrc, const TaintRegister *taintDst, Register displayRegister);
+static void genRM2XMM_ZEROED  (const RegMem *rmSrc, uint xmmDst);
+static void genPush (const RegMem *src);
+static void genPop (const RegMem *dst);
+static void genMov (const RegMem *src, const RegMem *dst);
+static RegMem getTemporaryRM2 (const RegMem *inUse1, const RegMem *inUse2);
+static RegMem getTemporaryRM (const RegMem *inUse);
+static void genRM (uint regSrc, const RegMem *dst, bool espWantSIB);
+static void genRM8 (uint regSrc, const RegMem *dst, bool espWantSIB);
+static const char *debugRegMem (const RegMem *rm);
+
+typedef void *JumpLabel;
+
+typedef struct
+{
+	const char 	*name;
+	uint8		opcode;
+}  JumpType;
+static const JumpType JE 	= {"e", 	0x04};
+static const JumpType JNE 	= {"ne", 	0x05};
+static const JumpType JGE 	= {"ge", 	0x0D};
+
+static JumpLabel genJump 		();
+static JumpLabel genJumpCond 	(const JumpType *type);
+static void setJumpTarget 		(JumpLabel l);
+static void genMovCond 			(const RegMem *src, const RegMem *dst, const JumpType *type);
+static void genCmp (const RegMem *lhs, const RegMem *rhs);
+static void genCmp8 (const RegMem *lhs, const RegMem *rhs);
+static void genCall (const char *msg, void *meth);
+static void genPushAll ();
+static void genPopAll ();
+static void genAddConst (uint value, const RegMem *dst);
+static void genSubConst (uint value, const RegMem *dst);
+
+/**
+ *
+ * @param rmSrc If null, only set the context taint.
+ */
+static void taint_object_store_impl (const RegMem *rmObj, int fieldIndex, const RegMem *rmSrc);
+
+static taint_t *argumentStackMarker;
+
+#if defined(TRACE_METHOD_END) && defined(__GNUC__)
+asm(".globl tStore\ntStore:	.long 0,0");
+#endif
+
+#ifdef KAFFE_VMDEBUG
+int jit_debug;
+#define	debug(x)	(jit_debug ? dprintf("%x:\t", CODEPC), dprintf x : 0)
+#else
+#define	debug(x)
+#endif
+
+#define	do_move_int(t, f)					\
+	if ((t) != (f)) {					\
+		OUT(0x89);					\
+		OUT(0xC0|(f<<3)|t);				\
+		debug(("movl %s,%s\n", regname(f), regname(t)));\
+		genTaintPropagate (GetRegisterRM (f), GetRegisterRM (t)); \
+	}
+
+#define	check_reg_01()						\
+	{							\
+		int _r_ = rreg_int(1);				\
+		int _w_ = wreg_int(0);				\
+		do_move_int(_w_, _r_);				\
+	}
+
+#define	set_slot_register(S,R,T)				\
+	forceRegister(S, R, T)
+
+#define	force_move_int(S, T, F)					\
+	if ((T) != (F)) {					\
+		set_slot_register(S, (T), Rint);		\
+		do_move_int((T), (F));				\
+		F = (T);					\
+	}
+
+#define	safe_move_int(T, F)					\
+	if ((T) != (F)) {					\
+		clobberRegister(T);				\
+		do_move_int((T), (F));				\
+		F = (T);					\
+	}
+
+
+const char* rnames[] = { "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "flt0/dbl0" };
+#define	regname(n)	rnames[n]
+
+/* IEEE mode setup */
+#define	IEEE_INVAL	0x0001
+#define	IEEE_DENORM	0x0002
+#define	IEEE_DIVZ	0x0004
+#define	IEEE_OVERF	0x0008
+#define	IEEE_UNDERF	0x0010
+#define	IEEE_LOS	0x0020
+#define	IEEE_NEAREST	0x0000
+#define	IEEE_DOWN	0x0400
+#define	IEEE_UP		0x0800
+#define	IEEE_CHOP	0x0C00
+#define	IEEE_EXTRA	0x1200
+#define	IEEE_MODE	(IEEE_DENORM|IEEE_UNDERF|IEEE_LOS|IEEE_DIVZ|IEEE_NEAREST|IEEE_EXTRA)
+
+extern bool used_ieee_division;
+
+#if defined(KAFFE_PROFILER)
+
+/* This code reads the timestamp register, and substracts it
+ * from COUNTER.  As this will scratch EDX and EAX, the second
+ * parameter said if they must be saved.  */
+#define profiler_start(COUNTER, SAVE_EDX_EAX) do {		\
+	int *__counter = (int *)&(COUNTER);			\
+	if (SAVE_EDX_EAX) {					\
+		/* Save EAX and EDX */				\
+		OUT(0x50|REG_edx);				\
+		OUT(0x50|REG_eax);				\
+		debug(("pushl edx\n"));				\
+		debug(("pushl eax\n"));				\
+	}							\
+								\
+	OUT(0x0F);						\
+	OUT(0x31);						\
+	debug(("rdtsc\n"));					\
+								\
+	OUT(0x29);						\
+	OUT(0x05);						\
+	LOUT((int)(__counter));					\
+	debug(("sub eax, 0x%x\n", (int)(__counter)));		\
+								\
+	OUT(0x19);						\
+	OUT(0x15);						\
+	LOUT((int)(__counter + 1));				\
+	debug(("sbb edx, 0x%x\n", (int)(__counter + 1)));	\
+								\
+	if (SAVE_EDX_EAX) {					\
+		/* Restore EAX and EDX */			\
+		OUT(0x58|REG_eax);				\
+		OUT(0x58|REG_edx);				\
+		debug(("popl eax\n"));				\
+		debug(("popl edx\n"));				\
+	}							\
+} while(0)
+
+/* This code reads the timestamp register, and add it to COUNTER.
+ * As this will scratch EDX and EAX, the second parameter said if
+ * they must be saved.  */
+#define profiler_end(COUNTER, SAVE_EDX_EAX) do {		\
+	int *__counter = (int *)&(COUNTER);			\
+	if (SAVE_EDX_EAX) {					\
+		/* Save EAX and EDX */				\
+		OUT(0x50|REG_edx);				\
+		OUT(0x50|REG_eax);				\
+		debug(("pushl edx\n"));				\
+		debug(("pushl eax\n"));				\
+	}							\
+								\
+	OUT(0x0F);						\
+	OUT(0x31);						\
+	debug(("rdtsc\n"));					\
+								\
+	OUT(0x01);						\
+	OUT(0x05);						\
+	LOUT((int)(__counter));					\
+	debug(("add eax, 0x%x\n", (int)(__counter)));		\
+								\
+	OUT(0x11);						\
+	OUT(0x15);						\
+	LOUT((int)(__counter + 1));				\
+	debug(("adc edx, 0x%x\n", (int)(__counter + 1)));	\
+								\
+	if (SAVE_EDX_EAX) {					\
+		/* Restore EAX and EDX */			\
+		OUT(0x58|REG_eax);				\
+		OUT(0x58|REG_edx);				\
+		debug(("popl eax\n"));				\
+		debug(("popl edx\n"));				\
+	}							\
+} while(0)
+
+#endif
+
+/* --------------------------------------------------------------------- */
+
+define_insn(unimplemented, unimplemented)
+{
+	KAFFEVM_ABORT();
+}
+
+define_insn(nop, nop)
+{
+	OUT(0x90);
+	debug(("nop\n"));
+}
+
+/* --------------------------------------------------------------------- */
+
+define_insn(prologue, prologue_xxx)
+{
+	label* l;
+
+	if (profFlag) {
+		debug(("Method: %s\n", globalMethod->name->data));
+	}
+#if defined(KAFFE_XPROFILER)
+	if (xProfFlag)
+	{
+		/* Store the pointer to this function in eax */
+		OUT(0xB8|REG_eax);
+		l = (label*)KaffeJIT3_newLabel();
+		l->type = Llong|Linternal|Labsolute;
+		l->to = 0;
+		l->at = (uintp)CODEPC;
+		LOUT(0);
+		debug(("movl #?,eax\n"));
+
+		/* Push second arg to profileArcHit */
+		OUT(0x50|REG_eax);
+		debug(("pushl eax\n"));
+
+		/* Get return address from the stack */
+		OUT(0x8B);
+		OUT((REG_eax<<3)|0x44);
+		OUT(0x24);
+		OUT(0x04);
+		debug(("movl eax,4(esp)\n"));
+
+		/* Push first arg to profileArcHit */
+		OUT(0x50|REG_eax);
+		debug(("pushl eax\n"));
+		/* Load the address to profileArcHit */
+		OUT(0xB8|REG_eax);
+		LOUT((int)profileArcHit);
+		debug(("movl profileArcHit,eax\n"));
+		/* Make the call */
+		OUT(0xFF);
+		OUT(0xD0|REG_eax);
+		debug(("call profileArcHit\n"));
+		/* Pop the args off */
+		OUT(0x58|REG_eax);
+		debug(("popl eax\n"));
+		OUT(0x58|REG_eax);
+		debug(("popl eax\n"));
+	}
+#endif
+	TRAP(PROLOGUE);
+
+	OUT(0x50|REG_ebp);
+	OUT(0x89);
+	OUT(0xC0|(REG_esp<<3)|REG_ebp);
+	OUT(0x81);
+	OUT(0xE8|REG_esp);
+
+	l = (label*)const_int(1);
+	l->type = Lframe|Labsolute|Lgeneral;
+	l->at = (uintp)CODEPC;
+	LOUT(0);
+
+	OUT(0x50|REG_edi);
+	OUT(0x50|REG_esi);
+	OUT(0x50|REG_ebx);
+
+	debug(("pushl ebp\n"));
+	debug(("movl esp,ebp\n"));
+	debug(("subl #?,esp\n"));
+	debug(("pushl edi\n"));
+	debug(("pushl esi\n"));
+	debug(("pushl ebx\n"));
+
+	genTaintRegPush (REG_edi);
+	genTaintRegPush (REG_esi);
+	genTaintRegPush (REG_ebx);
+
+	Method *meth = (Method *) const_int (2);
+
+	// Store initial context taint
+	RegMem rmInitial = GetContextRM (0);
+	genTaintXMM2RM (&TAINT_CONTEXT, &rmInitial);
+
+	// If the method has a this pointer, include the reference and (possible) object taint in the context taint
+	if (!(meth->accflags & ACC_STATIC))
+	{
+		// Push the initial context taint, so it can be restored in the epilogue
+		genTaintTaintRegPush (&TAINT_CONTEXT);
+
+		// Reference taint
+		RegMem rmThisReferenceTaint = GetLocalRM (SLOT2ARGOFFSET_TAINT(0));
+		genTaintCombine (rmThisReferenceTaint, RM_TAINT_CONTEXT);
+
+		// This pointer. This is not null, java already checked
+		// mov edi, [ebp + x]
+		OUT (0x8B); OUT (0xBD); LOUT (SLOT2ARGOFFSET(0));
+		RegMem rmObjectTaint = GetRegMem (REG_edi, OFFSET_OBJECT_TAINT, FLAG_IS_INDIRECT);
+		genTaintCombine (rmObjectTaint, RM_TAINT_CONTEXT);
+	}
+
+	// Clear partial contexts
+	if (globalMethod->context_count > 0)
+	{
+		// TODO: can unroll if globalMethod->context_count is small
+	 	OUT (0x51); OUT (0x50); OUT (0xb9); LOUT (globalMethod->context_count);
+	 	OUT (0x31); OUT (0xc0); OUT (0x89); OUT (0xEF);
+
+	 	// The +4 skips the initial context taint
+	 	OUT (0x81); OUT (0xEF); LOUT (globalMethod->context_count * sizeof (taint_t) + 4); // sub edi, ?
+	 	OUT (0xf3); OUT (0xab); // Rep stosb
+	 	OUT (0x58); OUT (0x59); // pop eax; pop ecx
+
+	 	debug (("TAINT: CLEAR CONTEXTS: push ecx; push eax; mov ecx, %d; xor eax, eax; mov edi, ebp; "
+	 			"sub edi, %d; rep stosd; pop eax; pop ecx\n",
+	 			globalMethod->context_count, globalMethod->context_count * sizeof (taint_t) + 4));
+	 }
+
+
+	/* Set the return value, for native methods that do not set it */
+	switch (meth->parsed_sig->signature->data[meth->parsed_sig->ret_and_args[0]])
+	{
+	case 'V':
+		break;
+	case 'F':
+		genTaintPropagate (RM_TAINT_CONTEXT, GetRegisterRM (REG_flt0));
+		break;
+	case 'D':
+		genTaintPropagate (RM_TAINT_CONTEXT, GetRegisterRM (REG_dbl0));
+		break;
+	default:
+		genTaintPropagate (RM_TAINT_CONTEXT, GetRegisterRM (REG_eax));
+		break;
+	}
+
+
+#if defined(KAFFE_PROFILER)
+	if (profFlag)
+	{
+		profiler_start(globalMethod->totalClicks, 0);
+
+		OUT(0xFF);
+		OUT(0x05);
+		LOUT((int)&(globalMethod->callsCount));
+		debug(("incl 0x%x\n",(int)&(globalMethod->callsCount)));
+	}
+#endif
+
+#if 0
+	/* If this method uses IEEE, set up the mode here */
+	if (used_ieee_division == true) {
+		OUT(0x68);
+		LOUT(0);
+		OUT(0x68);
+		LOUT(0);
+		debug(("pushl #0\n"));
+		debug(("pushl #0\n"));
+
+		OUT(0xD9);
+		OUT(0x3C);
+		OUT(0x24);
+		debug(("fnstcw (esp)\n"));
+
+		OUT(0x8B);
+		OUT((REG_eax<<3)|0x04);
+		OUT(0x24);
+		debug(("movl (esp),eax\n"));
+
+		OUT(0xB8|REG_eax);
+		LOUT(IEEE_MODE);
+		debug(("movl %d,eax\n", IEEE_MODE));
+
+		OUT(0x89);
+		OUT((REG_eax<<3)|0x44);
+		OUT(0x24);
+		OUT(0x04);
+		debug(("movl eax,4(esp)\n"));
+
+		OUT(0xD9);
+		OUT(0x6C);
+		OUT(0x24);
+		OUT(0x04);
+		debug(("fldcw 4(esp)\n"));
+	}
+#endif
+}
+
+#if defined (HAVE_GCJ_SUPPORT)
+#include "gcj/gcj.h"
+
+/*
+ * Establish JIT3 callee-saved register information for i386
+ * We must tell gcj where esi, edi, and ebx have been stored
+ * on this frame, as an offset from the CFA.
+ * In addition, we must tell it where the caller's esp was stored
+ *
+ * This depends on prologue_xxx so I put it here (XXX?).
+ */
+void
+arch_get_frame_description(int framesize,
+        struct kaffe_frame_descriptor frame_desc[],
+        int *n)
+{
+        int i = 0;
+        int rsave_area_offset = CFA_OFFSET + framesize;
+
+        frame_desc[i].idx = DWARF_FRAME_RETURN_COLUMN;
+        frame_desc[i].offset = RETADDR_SAVED_OFFSET;
+        i++;
+
+        frame_desc[i].idx = CFA_REGISTER;               /* gcc_esp */
+        frame_desc[i].offset = CFA_SAVED_OFFSET;
+        i++;
+
+	if (framesize == -1) {		/* -1 indicates trampoline frame */
+		*n = i;
+		return;
+	}
+
+        /* NB: since CFA is pointing at caller's ret pc + 4,
+         * subtracting CFA_OFFSET + framesize points at the last
+         * slot.  The callee-saved registers are stored one word
+         * below, hence the 1 * 4
+         */
+        frame_desc[i].idx = DBX_REGISTER_NUMBER(/* gcc_edi */ 5);
+        frame_desc[i].offset = - (rsave_area_offset + 1 * 4);
+        i++;
+
+        frame_desc[i].idx = DBX_REGISTER_NUMBER(/* gcc_esi */ 4);
+        frame_desc[i].offset = - (rsave_area_offset + 2 * 4);
+        i++;
+
+        frame_desc[i].idx = DBX_REGISTER_NUMBER(/* gcc_ebx */ 3);
+        frame_desc[i].offset = - (rsave_area_offset + 3 * 4);
+        i++;
+
+        *n = i;
+}
+#endif /* HAVE_GCJ_SUPPORT */
+
+define_insn(check_stack_limit, check_stack_limit_xRC)
+{
+	int r = rreg_int(1);
+	label* l = const_label(2);
+
+	OUT(0x39);
+	OUT(0xC0|(r<<3)|REG_esp);
+	debug(("cmpl esp,%s\n", regname(r)));
+
+	OUT(0x0F);
+	OUT(0x87);
+
+#if TRAP_STACK_LIMIT
+	LOUT(6);
+	debug(("jugt +6\n"));
+#else
+	LOUT(5);
+	debug(("jugt +5\n"));
+#endif
+	TRAP(STACK_LIMIT);
+
+	OUT(0xE8);
+	l->type |= Llong|Lrelative;
+	l->at = CODEPC;
+	LOUT(0);
+	l->from = CODEPC;
+	debug(("call soft_stackoverflow\n"));
+}
+
+define_insn(exception_prologue, eprologue_xLx)
+{
+	label* l;
+
+	OUT(0x89);
+	OUT(0xC0|(REG_ebp<<3)|REG_ecx);
+
+	OUT(0x81);
+	OUT(0xE8|REG_ecx);
+
+	/* Remember where the framesize is to go */
+	l = (label*)const_int(1);
+	l->type = Lframe|Labsolute|Lgeneral;
+	l->at = (uintp)CODEPC;
+	LOUT(0);
+
+	uint subtract = 3*(SLOTSIZE + sizeof (taint_t));
+	if (!(globalMethod->accflags & ACC_STATIC))
+	{
+		subtract += 4; // To mirror prologue code
+	}
+
+	OUT(0x81);
+	OUT(0xE8|REG_ecx);
+
+	LOUT(subtract);
+
+	OUT(0x89);
+	OUT(0xC0|(REG_ecx<<3)|REG_esp);
+
+	debug(("movl ebp,ecx\n"));
+	debug(("subl #?,ecx\n"));
+	debug(("subl #3*(SLOTSIZE + sizeof (taint_t)),ecx\n"));
+	debug(("movl ecx,esp\n"));
+
+#if 0
+	if (used_ieee_division == true) {
+		OUT(0x81);
+		OUT(0xE8|REG_esp);
+		LOUT(SLOTSIZE);
+
+		debug(("subl #%d,esp\n", SLOTSIZE));
+
+		OUT(0x8B);
+		OUT((REG_eax<<3)|0x04);
+		OUT(0x24);
+		debug(("movl (esp),eax\n"));
+
+		OUT(0xB8|REG_eax);
+		LOUT(IEEE_MODE);
+		debug(("movl %d,eax\n", IEEE_MODE));
+
+		OUT(0x89);
+		OUT((REG_eax<<3)|0x44);
+		OUT(0x24);
+		OUT(0x04);
+		debug(("movl eax,4(esp)\n"));
+
+		OUT(0xD9);
+		OUT(0x6C);
+		OUT(0x24);
+		OUT(0x04);
+		debug(("fldcw 4(esp)\n"));
+	}
+#endif
+}
+
+define_insn(epilogue, epilogue_xxx)
+{
+
+	label *el;
+
+	if( (el = KaffeJIT3_getLastEpilogueLabel()) && (el->at == (CODEPC - 4)) )
+	{
+		/*
+		 * Nothing to jump over to get to the epilogue...  Replace
+		 * the jump code with regular epilogue.
+		 */
+		el->type = Lnull;
+		CODEPC -= 5;
+	}
+	else if( el && (el->at != (CODEPC - 4)) )
+	{
+		/* The function ends with a throw, not a return. */
+	}
+	KaffeJIT3_setEpilogueLabel((uintp)CODEPC);
+
+#if 0
+	/* If this method uses IEEE, restore it */
+	if (used_ieee_division == true) {
+#if 0
+		OUT(0xD9);
+		OUT(0x2C);
+		OUT(0x24);
+		debug(("fldcw (esp)\n"));
+#endif
+		OUT(0xD9);
+		OUT(0x6C);
+		OUT(0x24);
+		OUT(0);
+		debug(("fldcw 0(esp)\n"));
+
+		OUT(0x81);
+		OUT(0xC0|REG_esp);
+		LOUT(8);
+		debug(("addl 8,esp\n"));
+	}
+#endif
+
+#if defined(KAFFE_PROFILER)
+	if (profFlag) {
+		profiler_end(globalMethod->totalClicks, 1);
+	}
+#endif
+
+	Method *meth = (Method *) const_int (2);
+	if (!(meth->accflags & ACC_STATIC))
+	{
+		// If there is a this pointer, its taint is included in the initial context taint, pop the value without it
+		// Pop the initial context taint
+		genTaintTaintRegPop (&TAINT_CONTEXT);
+	}
+	else
+	{
+		// Restore initial context taint
+		RegMem rmInitial = GetContextRM (0);
+		genTaintWorking2XMM (&rmInitial, &TAINT_CONTEXT, NOREGISTER);
+	}
+
+	genTaintRegPop (REG_ebx);
+	genTaintRegPop (REG_esi);
+	genTaintRegPop (REG_edi);
+
+	OUT(0x58|REG_ebx);
+	OUT(0x58|REG_esi);
+	OUT(0x58|REG_edi);
+	OUT(0x89);
+	OUT(0xC0|(REG_ebp<<3)|REG_esp);
+	OUT(0x58|REG_ebp);
+
+	debug(("popl ebx\n"));
+	debug(("popl esi\n"));
+	debug(("popl edi\n"));
+	debug(("movl ebp,esp\n"));
+	debug(("popl ebp\n"));
+
+	TRAP(RETURN);
+	OUT(0xC3);
+
+	debug(("ret\n"));
+}
+
+/* --------------------------------------------------------------------- */
+
+define_insn(spill_int, spill_Rxx)
+{
+	int r = sreg_int(0);
+	int o = const_int(1);
+
+	OUT(0x89);
+	OUT(0x80|(r<<3)|REG_ebp);
+	LOUT(o);
+
+	debug(("movl %s,%d(ebp)\n", regname(r), o));
+
+	genTaintRegSpill (r, const_int(2));
+}
+
+define_insn(spill_float, fspill_Rxx)
+{
+	int o = const_int(1);
+
+	(void)sreg_float(0);
+
+	OUT(0xD9);
+	OUT(0x98|REG_ebp);
+	LOUT(o);
+
+	debug(("fstp %d(ebp)\n", o));
+
+	genTaintRegSpill (REG_flt0, const_int(2));
+}
+
+define_insn(spill_double, fspilll_Rxx)
+{
+	int o = const_int(1);
+
+	(void)sreg_double(0);
+
+	OUT(0xDD);
+	OUT(0x98|REG_ebp);
+	LOUT(o);
+
+	debug(("fstpl %d(ebp)\n", o));
+
+	// Save only into lowest slot
+	genTaintRegSpill (REG_dbl0, const_int(2));
+}
+
+define_insn(reload_int, reload_Rxx)
+{
+	int r = lreg_int(0);
+	int o = const_int(1);
+
+	// This test avoids loading a taint when the previous stack pointer is loaded for check_stack_overflow
+	// TODO: that this is required most likely indicates a taint is not cleared somewhere
+	if (const_int(2) != o)
+		genTaintRegReload (r, const_int(2));
+
+	OUT(0x8B);
+	OUT(0x80|(r<<3)|REG_ebp);
+	LOUT(o);
+
+	debug(("movl %d(ebp),%s\n", o, regname(r)));
+}
+
+define_insn(reload_float, freload_Rxx)
+{
+	int o = const_int(1);
+
+	lreg_float(0);
+
+	genTaintRegReload (REG_flt0, const_int(2));
+
+	OUT(0xD9);
+	OUT(0x80|REG_ebp);
+	LOUT(o);
+
+	debug(("fld %d(ebp)\n", o));
+}
+
+define_insn(reload_double, freloadl_Rxx)
+{
+	int r = lreg_double(0);
+	int o = const_int(1);
+
+	genTaintRegReload (REG_dbl0, const_int(2));
+
+	OUT(0xDD);
+	OUT(0x80|REG_ebp);
+	LOUT(o);
+
+	debug(("fldl %d(ebp) %d\n", o, r));
+}
+
+void
+movereg_RR(int toreg, int fromreg)
+{
+	do_move_int(toreg, fromreg);
+}
+
+/* --------------------------------------------------------------------- */
+
+define_insn(move_int_const, move_RxC)
+{
+	int val = const_int(2);
+	int w = wreg_int(0);
+
+	if (val == 0) {
+		OUT(0x31);
+		OUT(0xC0|(w<<3)|w);
+		debug(("xorl %s,%s\n", regname(w), regname(w)));
+	}
+	else {
+		OUT(0xB8|w);
+		LOUT(val);
+
+		debug(("movl #%d,%s\n", val, regname(w)));
+	}
+
+	genTaintPropagate (RM_TAINT_CONTEXT, GetRegisterRM (w));
+}
+
+define_insn(move_label_const, move_RxL)
+{
+	label* l = const_label(2);
+	int w = wreg_int(0);
+
+	OUT(0xB8|w);
+	l->type |= Llong|Labsolute;
+	l->at = CODEPC;
+	LOUT(0);
+
+	debug(("movl #%s,%s\n", KaffeJIT3_getLabelName(l), regname(w)));
+
+	genClearTaint (w);
+}
+
+define_insn(move_int, move_RxR)
+{
+	int r = rreg_int(2);
+	int w = wreg_int(0);
+
+	if (r != w) {
+		OUT(0x89);
+		OUT(0xC0|(r<<3)|w);
+		debug(("movl %s,%s\n", regname(r), regname(w)));
+
+		genTaintPropagate (GetRegisterRM (r), GetRegisterRM (w));
+	}
+}
+
+define_insn(move_float_const, fmove_RxC)
+{
+	jvalue d;
+
+	d.d = const_float(2);
+	int w = wreg_float(0);
+
+	if (d.d == 0.0) {
+		OUT(0xD9);
+		OUT(0xEE);
+
+		debug(("fldz\n"));
+
+		if ((d.j >> 63) & 1) {
+			OUT(0xD9);
+			OUT(0xe0);
+
+			debug(("fchs\n"));
+		}
+
+		genClearTaint (w);
+	}
+	else if (d.d == 1.0) {
+		OUT(0xD9);
+		OUT(0xE8);
+
+		debug(("fld1\n"));
+
+		genClearTaint (w);
+	}
+	else {
+		KAFFEVM_ABORT();
+	}
+}
+
+define_insn(move_float, fmove_RxR)
+{
+	int or = rslot_float(2);
+	int ow = wslot_float(0);
+
+	if (or != ow) {
+		wreg_float(0);
+
+		OUT(0xD9);
+		OUT(0x80|REG_ebp);
+		LOUT(or);
+
+		debug(("fld %d(ebp)\n", or));
+
+		genTaintPropagate (GetRegisterRM (or), GetRegisterRM (ow));
+	}
+}
+
+define_insn(move_double_const, fmovel_RxC)
+{
+	jvalue d;
+
+	d.d = const_double(2);
+	int w = wreg_double(0);
+
+	if (d.d == 0.0) {
+		OUT(0xD9);
+		OUT(0xEE);
+
+		debug(("fldz\n"));
+		if ((d.j >> 63) & 1) {
+			OUT(0xD9);
+			OUT(0xe0);
+
+			debug(("fchs\n"));
+		}
+
+		genClearTaint (w);
+	}
+	else if (d.d == 1.0) {
+		OUT(0xD9);
+		OUT(0xE8);
+
+		debug(("fld1\n"));
+
+		genClearTaint (w);
+	}
+	else {
+		KAFFEVM_ABORT();
+	}
+}
+
+define_insn(move_double, fmovel_RxR)
+{
+	int or = rslot_double(2);
+	int ow = wslot_double(0);
+
+	if (or != ow) {
+		wreg_double(0);
+
+		OUT(0xDD);
+		OUT(0x80|REG_ebp);
+		LOUT(or);
+
+		debug(("fldl %d(ebp)\n", or));
+
+		genTaintPropagate (GetRegisterRM (or), GetRegisterRM (ow));
+	}
+}
+
+/* --------------------------------------------------------------------- */
+
+define_insn(add_int, add_RRR)
+{
+	int r;
+	int w;
+
+	check_reg_01();
+
+	r = rreg_int(2);
+	w = rwreg_int(0);
+
+	OUT(0x01);
+    OUT(0xC0|(r<<3)|w);
+
+	debug(("addl %s,%s\n", regname(r), regname(w)));
+	genTaintCombine (GetRegisterRM (r), GetRegisterRM (w));
+}
+
+define_insn(adc_int, adc_RRR)
+{
+	int r;
+	int w;
+
+	r = rreg_int(2);
+	w = rwreg_int(0);
+
+	OUT(0x11);
+        OUT(0xC0|(r<<3)|w);
+
+	debug(("adcl %s,%s\n", regname(r), regname(w)));
+	genTaintCombine (GetRegisterRM (r), GetRegisterRM (w));
+}
+
+define_insn(add_float, fadd_RRR)
+{
+	int rr, rm;
+
+	/*
+	 * XXX Order is important here...  If we put slot 2 into memory and
+	 * slot 1 into the register we get a whole bunch of excess
+	 * spills/reloaeds.
+	 */
+	rm = rslot_float(1);	/* Get slot 1 into memory */
+	rr = rreg_float(2);	/* Load slot 2 into the register stack */
+	wreg_float(0);		/* Result will be in register stack */
+
+	OUT(0xD8);
+	OUT(0x80|REG_ebp);
+	LOUT(rm);
+
+	debug(("fadd %d(ebp)\n", rm));
+	genTaintCombine (GetLocalRM (slot_taint (1)), GetRegisterRM (rr));
+}
+
+define_insn(add_double, faddl_RRR)
+{
+	int rr, rm;
+
+	rm = rslot_double(1);	/* Get slot 1 into memory */
+	rr = rreg_double(2);	/* Load slot 2 into the register stack */
+	wreg_double(0);		/* Result will be in register stack */
+
+	OUT(0xDC);
+	OUT(0x80|REG_ebp);
+	LOUT(rm);
+
+	debug(("faddl %d(ebp)\n", rm));
+	genTaintCombine (GetLocalRM (slotOffsetNoSpillTaint(seq_slot (s, 1), Rdouble)), GetRegisterRM (REG_dbl0));
+}
+
+define_insn(sub_int, sub_RRR)
+{
+	int r;
+	int w;
+
+	check_reg_01();
+
+	r = rreg_int(2);
+	w = rwreg_int(0);
+
+	OUT(0x29);
+        OUT(0xC0|(r<<3)|w);
+
+	debug(("subl %s,%s\n", regname(r), regname(w)));
+	genTaintCombine (GetRegisterRM (r), GetRegisterRM (w));
+}
+
+define_insn(sbc_int, sbc_RRR)
+{
+	int r;
+	int w;
+
+	r = rreg_int(2);
+	w = rwreg_int(0);
+
+	OUT(0x19);
+        OUT(0xC0|(r<<3)|w);
+
+	debug(("sbbl %s,%s\n", regname(r), regname(w)));
+	genTaintCombine (GetRegisterRM (r), GetRegisterRM (w));
+}
+
+define_insn(sub_float, fsub_RRR)
+{
+	int rr, rm;
+
+	rm = rslot_float(1);	/* Get slot 1 into memory */
+	rr = rreg_float(2);	/* Load slot 2 into the register stack */
+	wreg_float(0);		/* Result will be in register stack */
+
+	OUT(0xD8);
+	OUT(0xA8|REG_ebp);
+	LOUT(rm);
+
+	debug(("fsub %d(ebp)\n", rm));
+	genTaintCombine (GetLocalRM (slot_taint (1)), GetRegisterRM (rr));
+}
+
+define_insn(sub_double, fsubl_RRR)
+{
+	int rr, rm;
+
+	rm = rslot_double(1);	/* Get slot 1 into memory */
+	rr = rreg_double(2);	/* Load slot 2 into the register stack */
+	wreg_double(0);		/* Result will be in register stack */
+
+	OUT(0xDC);
+	OUT(0xA8|REG_ebp);
+	LOUT(rm);
+
+	debug(("fsubl %d(ebp)\n", rm));
+	genTaintCombine (GetLocalRM (slotOffsetNoSpillTaint(seq_slot (s, 1), Rdouble)), GetRegisterRM (rr));
+}
+
+define_insn(neg_float, negf_RxR)
+{
+	rreg_float(2);
+	wreg_float(0);
+
+	OUT(0xD9);
+	OUT(0xe0);
+
+	debug(("fchs\n"));
+}
+
+define_insn(neg_double, negd_RxR)
+{
+	rreg_double(2);
+	wreg_double(0);
+
+	OUT(0xD9);
+	OUT(0xe0);
+
+	debug(("fchsl\n"));
+}
+
+define_insn(mul_int, mul_RRR)
+{
+	int r;
+	int w;
+
+	check_reg_01();
+
+	r = rreg_int(2);
+	w = rwreg_int(0);
+
+	OUT(0x0F);
+	OUT(0xAF);
+        OUT(0xC0|(w<<3)|r);
+
+	debug(("imull %s,%s\n", regname(r), regname(w)));
+	genTaintCombine (GetRegisterRM (r), GetRegisterRM (w));
+}
+
+define_insn(mul_float, fmul_RRR)
+{
+	int rr, rm;
+
+	rm = rslot_float(1);	/* Get slot 1 into memory */
+	rr = rreg_float(2);	/* Load slot 2 into the register stack */
+	wreg_float(0);		/* Result will be in register stack */
+
+	OUT(0xD8);
+	OUT(0x88|REG_ebp);
+	LOUT(rm);
+
+	debug(("fmul %d(ebp)\n", rm));
+	genTaintCombine (GetLocalRM (slot_taint (1)), GetRegisterRM (rr));
+}
+
+define_insn(mul_double, fmull_RRR)
+{
+	int rr, rm;
+
+	rm = rslot_double(1);	/* Get slot 1 into memory */
+	rr = rreg_double(2);	/* Load slot 2 into the register stack */
+	wreg_double(0);		/* Result will be in register stack */
+
+	OUT(0xDC);
+	OUT(0x88|REG_ebp);
+	LOUT(rm);
+
+	debug(("fmull %d(ebp)\n", rm));
+	genTaintCombine (GetLocalRM (slotOffsetNoSpillTaint(seq_slot (s, 1), Rdouble)), GetRegisterRM (rr));
+}
+
+define_insn(div_int, div_RRR)
+{
+	int r;
+	int w;
+	label *l1;
+
+	check_reg_01();
+
+	w = rwreg_int(0);
+
+	/* Can only divide accumulator. */
+	force_move_int(seq_slot(s, 0), REG_eax, w);
+
+	/* EDX is also used so get hold of it */
+	clobberRegister(REG_edx);
+
+	r = rreg_int(2);
+
+	assert(r != REG_eax);
+	assert(r != REG_edx);
+
+	/* special case for LONG_MIN / -1l: r == -1 ? -eax : eax / r  */
+	OUT(0x83);
+	OUT(0xF8|r);
+	OUT(0xFF);
+	debug(("cmp #0xFF,%s\n", regname(r)));
+
+	l1 = KaffeJIT3_newLabel();
+	l1->type = Linternal| Llong8|Lrelative;
+	OUT(0x74);
+	l1->at = CODEPC;
+	OUT(0);
+	l1->from = CODEPC;
+	debug(("je neg\n"));
+
+	/* Setup EDX - should contains the sign of EAX */
+	do_move_int(REG_edx, REG_eax);
+#if 0
+	OUT(0xC1);
+	OUT(0xF8|REG_edx);
+	OUT(31);
+	debug(("sarl #31,edx\n"));
+#else
+	OUT(0x99);
+	debug(("cltd\n"));
+#endif
+
+	OUT(0xF7);
+        OUT(0xF8|r);
+	debug(("idivl %s,%s\n", regname(r), regname(w)));
+
+	OUT(0xEB);
+	OUT(2);
+	debug(("jmp +2\n"));
+
+	debug(("neg:\n"));
+	l1->to = CODEPC;
+	OUT(0xF7);
+	OUT(0xD8|REG_eax);
+	debug(("neg eax\n"));
+
+	genTaintCombine (GetRegisterRM (r), GetRegisterRM (w));
+}
+
+define_insn(div_float, fdiv_RRR)
+{
+	int rr, rm;
+
+	rm = rslot_float(1);	/* Get slot 1 into memory */
+	rr = rreg_float(2);	/* Load slot 2 into the register stack */
+	wreg_float(0);		/* Result will be in register stack */
+
+	OUT(0xD8);
+	OUT(0xB8|REG_ebp);
+	LOUT(rm);
+
+	debug(("fdiv %d(ebp)\n", rm));
+	genTaintCombine (GetLocalRM (slot_taint (1)), GetRegisterRM (rr));
+}
+
+define_insn(div_double, fdivl_RRR)
+{
+	int rr, rm;
+
+	rm = rslot_double(1);	/* Get slot 1 into memory */
+	rr = rreg_double(2);	/* Load slot 2 into the register stack */
+	wreg_double(0);		/* Result will be in register stack */
+
+	OUT(0xDC);
+	OUT(0xB8|REG_ebp);
+	LOUT(rm);
+
+	debug(("fdivl %d(ebp)\n", rm));
+	genTaintCombine (GetLocalRM (slotOffsetNoSpillTaint(seq_slot (s, 1), Rdouble)), GetRegisterRM (rr));
+}
+
+define_insn(rem_int, rem_RRR)
+{
+	int r;
+	int w;
+	label *l1;
+
+	check_reg_01();
+
+	w = rwreg_int(0);
+
+	/* Can only divide accumulator. */
+	force_move_int(seq_slot(s, 0), REG_eax, w);
+
+	/* EDX is also used so get hold of it */
+	clobberRegister(REG_edx);
+
+	r = rreg_int(2);
+
+	assert(r != REG_eax);
+	assert(r != REG_edx);
+
+	genTaintCombine (GetRegisterRM (r), GetRegisterRM (w));
+
+	/* special case for LONG_MIN % -1l: r == -1 ? 0 : eax / r  */
+	OUT(0x83);
+	OUT(0xF8|r);
+	OUT(0xFF);
+	debug(("cmp #0xFF,%s\n", regname(r)));
+
+	l1 = KaffeJIT3_newLabel();
+	l1->type = Linternal| Llong8|Lrelative;
+	OUT(0x74);
+	l1->at = CODEPC;
+	OUT(0);
+	l1->from = CODEPC;
+	debug(("je const0\n"));
+
+	/* Setup EDX - should contains the sign of EAX */
+	do_move_int(REG_edx, REG_eax);
+#if 0
+	OUT(0xC1);
+	OUT(0xF8|REG_edx);
+	OUT(31);
+	debug(("sarl #31,edx\n"));
+#else
+	OUT(0x99);
+	debug(("cltd\n"));
+#endif
+
+	OUT(0xF7);
+        OUT(0xF8|r);
+	debug(("idivl %s,%s\n", regname(r), regname(w)));
+
+	OUT(0xEB);
+	OUT(2);
+	debug(("jmp +2\n"));
+
+	debug(("const0:\n"));
+	l1->to = CODEPC;
+	OUT(0x31);
+        OUT(0xC0|(REG_edx<<3)|REG_edx);
+	debug(("xorl edx,edx\n"));
+
+	/* Result is in EDX not EAX - we must force the slot register */
+	set_slot_register(seq_dst(s), REG_edx, Rint);
+}
+
+/* --------------------------------------------------------------------- */
+
+define_insn(and_int, and_RRR)
+{
+	int r;
+	int w;
+
+	check_reg_01();
+
+	r = rreg_int(2);
+	w = rwreg_int(0);
+
+	OUT(0x21);
+        OUT(0xC0|(r<<3)|w);
+
+	debug(("andl %s,%s\n", regname(r), regname(w)));
+	genTaintCombine (GetRegisterRM (r), GetRegisterRM (w));
+}
+
+define_insn(or_int, or_RRR)
+{
+	int r;
+	int w;
+
+	check_reg_01();
+
+	r = rreg_int(2);
+	w = rwreg_int(0);
+
+	OUT(0x09);
+        OUT(0xC0|(r<<3)|w);
+
+	debug(("orl %s,%s\n", regname(r), regname(w)));
+	genTaintCombine (GetRegisterRM (r), GetRegisterRM (w));
+}
+
+define_insn(xor_int, xor_RRR)
+{
+	int r;
+	int w;
+
+	check_reg_01();
+
+	r = rreg_int(2);
+	w = rwreg_int(0);
+
+	OUT(0x31);
+        OUT(0xC0|(r<<3)|w);
+
+	debug(("xorl %s,%s\n", regname(r), regname(w)));
+	genTaintCombine (GetRegisterRM (r), GetRegisterRM (w));
+}
+
+define_insn(ashr_int, ashr_RRR)
+{
+	int r;
+	int w;
+
+	check_reg_01();
+
+	r = rreg_ideal_int(2, REG_ecx);
+
+	/* Can only shift by ECX. */
+	safe_move_int(REG_ecx, r);
+
+	w = rwreg_int(0);
+
+	OUT(0xD3);
+        OUT(0xF8|w);
+
+	debug(("sarl %s,%s\n", regname(r), regname(w)));
+	genTaintCombine (GetRegisterRM (r), GetRegisterRM (w));
+}
+
+define_insn(lshr_int, lshr_RRR)
+{
+	int r;
+	int w;
+
+	check_reg_01();
+
+	r = rreg_ideal_int(2, REG_ecx);
+
+	/* Can only shift by ECX. */
+	safe_move_int(REG_ecx, r);
+
+	w = rwreg_int(0);
+
+	OUT(0xD3);
+        OUT(0xE8|w);
+
+	debug(("shrl %s,%s\n", regname(r), regname(w)));
+	genTaintCombine (GetRegisterRM (r), GetRegisterRM (w));
+}
+
+define_insn(lshl_int, lshl_RRR)
+{
+	int r;
+	int w;
+
+	check_reg_01();
+
+	r = rreg_ideal_int(2, REG_ecx);
+
+	/* Can only shift by ECX. */
+	safe_move_int(REG_ecx, r);
+
+	w = rwreg_int(0);
+
+	OUT(0xD3);
+        OUT(0xE0|w);
+
+	debug(("shll %s,%s\n", regname(r), regname(w)));
+	genTaintCombine (GetRegisterRM (r), GetRegisterRM (w));
+}
+
+/* --------------------------------------------------------------------- */
+
+define_insn(load_int, load_RxR)
+{
+	int r = rreg_int(2);
+	int w = wreg_int(0);
+
+	OUT(0x8B);
+	OUT(0x00|(w<<3)|r);
+	if (r == REG_esp) {
+		OUT(0x20|REG_esp);
+	}
+
+	debug(("movl (%s),%s\n", regname(r), regname(w)));
+}
+
+define_insn(load_float, fload_RxR)
+{
+	int r;
+
+	r = rreg_int(2);
+	wreg_float(0);
+
+	OUT(0xD9);
+	OUT(0x00|r);
+
+	debug(("fld (%s)\n", regname(r)));
+
+	genTaintPropagate (GetRegisterRM (r), GetRegisterRM (REG_flt0));
+}
+
+define_insn(load_double, floadl_RxR)
+{
+	int r;
+
+	r = rreg_int(2);
+	wreg_double(0);
+
+	OUT(0xDD);
+	OUT(0x00|r);
+
+	debug(("fldl (%s)\n", regname(r)));
+	genTaintPropagate (GetRegisterRM (r), GetRegisterRM (REG_dbl0));
+}
+
+define_insn(store_int, store_xRR)
+{
+	int r = rreg_int(2);
+	int w = rreg_int(1);
+
+	OUT(0x89);
+	OUT(0x00|(r<<3)|w);
+	if (w == REG_esp) {
+		OUT(0x20|REG_esp);
+	}
+
+	debug(("movl %s,(%s)\n", regname(r), regname(w)));
+}
+
+define_insn(store_float, fstore_RxR)
+{
+	int w;
+
+	rreg_float(2);
+	w = rreg_int(1);
+
+	OUT(0xD9);
+	OUT(0x18|w);
+
+	debug(("fstp (%s)\n", regname(w)));
+}
+
+define_insn(store_double, fstorel_RxR)
+{
+	int w;
+
+	rreg_double(2);
+	w = rreg_int(1);
+
+	OUT(0xDD);
+	OUT(0x18|w);
+
+	debug(("fstlp (%s)\n", regname(w)));
+}
+
+/* --------------------------------------------------------------------- */
+
+define_insn(cmp_int, cmp_xRR)
+{
+	int r1 = rreg_int(1);
+	int r2 = rreg_int(2);
+
+	if (currentContext && currentContext->bitmap_index >= 0)
+	{
+		genTaintPropagate3 (GetRegisterRM (r2), GetRegisterRM (r1), GetContextRM (currentContext->bitmap_index + 1));
+		// Include in the current context taint, so that it is available when the non-taken branch is updated.
+		// TODO: this can be skipped if the non-taken branch is scheduled better
+		genTaintCombine3 (GetRegisterRM (r2), GetRegisterRM (r1), RM_TAINT_CONTEXT);
+	}
+
+	OUT(0x39);
+	OUT(0xC0|(r2<<3)|r1);
+
+	debug(("cmpl %s,%s\n", regname(r2), regname(r1)));
+}
+
+/* --------------------------------------------------------------------- */
+
+define_insn(cvt_int_float, cvtif_RxR)
+{
+	int r, rf;
+
+	r = rslot_int(2);
+	rf = wreg_float(0);
+
+	OUT(0xDB);
+	OUT(0x80|REG_ebp);
+	LOUT(r);
+
+	debug(("fild %d(ebp)\n", r));
+	genTaintPropagate (GetLocalRM (slot_taint (2)), GetRegisterRM (rf));
+}
+
+define_insn(cvt_int_double, cvtid_RxR)
+{
+	int r, rf;
+
+	r = rslot_int(2);
+	rf = wreg_double(0);
+
+	OUT(0xDB);
+	OUT(0x80|REG_ebp);
+	LOUT(r);
+
+	debug(("fild %d(ebp)\n", r));
+	genTaintPropagate (GetLocalRM (slot_taint (2)), GetRegisterRM (rf));
+}
+
+#if 0
+
+	We cannot use these functions since the long is store in the
+	opposite order to what they expect.
+
+define_insn(cvt_long_float, cvtlf_RxR)
+{
+	int r;
+
+	r = rslot_long(2);
+	wreg_float(0);
+
+	OUT(0xDF);
+	OUT(0xA8|REG_ebp);
+	LOUT(r);
+
+	debug(("fildll %d(ebp)\n", r));
+}
+
+define_insn(cvt_long_double, cvtld_RxR)
+{
+	int r;
+
+	r = rslot_long(2);
+	wreg_double(0);
+
+	OUT(0xDF);
+	OUT(0xA8|REG_ebp);
+	LOUT(r);
+
+	debug(("fildll %d(ebp)\n", r));
+}
+
+#endif
+
+define_insn(cvt_float_double, cvtfd_RxR)
+{
+	int o = rslot_float(2);
+	int r = wreg_double(0);
+
+	OUT(0xD9);
+	OUT(0x80|REG_ebp);
+	LOUT(o);
+
+	debug(("fld %d(ebp)\n", o));
+	genTaintPropagate (GetRegisterRM (r), GetLocalRM (slot_taint (2)));
+}
+
+define_insn(cvt_double_float, cvtdf_RxR)
+{
+	int o, r;
+
+	o = rslot_double(2);
+	r = wreg_float(0);
+
+	OUT(0xDD);
+	OUT(0x80|REG_ebp);
+	LOUT(o);
+
+	debug(("fldl %d(ebp)\n", o));
+	genTaintPropagate (GetRegisterRM (r), GetLocalRM (slotOffsetNoSpillTaint(seq_slot (s, 2), Rdouble)));
+}
+
+/* --------------------------------------------------------------------- */
+
+define_insn(build_key, set_word_xxC)
+{
+	jint val = const_int(2);
+
+	LOUT(val);
+
+	debug((".word %08x\n", val));
+}
+
+define_insn(build_code_ref, set_wordpc_xxC)
+{
+	label* l = const_label(2);
+
+	l->type |= Llong|Labsolute;
+	l->at = CODEPC;
+	LOUT(0);
+	l->from = CODEPC;
+	debug((".word %s\n", KaffeJIT3_getLabelName(l)));
+}
+
+/* --------------------------------------------------------------------- */
+
+define_insn(set_label, set_label_xxC)
+{
+	label* l = const_label(2);
+	l->to = CODEPC;
+}
+
+RegMem GetTaintLocalRM (int localIndex, bool taint)
+{
+	int index = localIndex + maxArgs;
+	// Check if the local is in a register
+	if (localinfo[localIndex].slot->regno != NOREGISTER)
+	{
+		return GetRegisterRM (localinfo[localIndex].slot->regno);
+	}
+#if 0
+	else if (localIndex < maxArgs)
+	{
+		/* TODO: this case is a workaround that causes problems if an argument is kept in a register.
+	     * In that case, the test above may fail, causing the value to be loaded from the empty local
+	     * slot. This is fixed by ensuring it is loaded from the argument slot. It would be better if
+	     * the correct register is used.
+	     */
+		return GetLocalRM (taint ? SLOT2ARGOFFSET_TAINT (localIndex) : SLOT2ARGOFFSET (localIndex));
+	}
+#endif
+	else
+	{
+		/*uint i;
+		for (i = 0; i < NR_REGISTERS; i++)
+		{
+			if (reginfo[i].slot && !taint && reginfo[i].slot->offset == SLOT2LOCALOFFSET (index))
+			{
+				return GetRegisterRM (reginfo[i].slot->regno);
+			}
+		}*/
+
+		return GetLocalRM (taint ? SLOT2LOCALOFFSET_TAINT (index) : SLOT2LOCALOFFSET (index));
+	}
+}
+
+RegMem GetTaintLocalRM2 (int localIndex, bool taint)
+{
+	if (localinfo[localIndex].slot->regno != NOREGISTER)
+	{
+		return GetRegisterRM (localinfo[localIndex].slot->regno);
+	}
+	else
+	{
+		return GetLocalRM (taint ? localinfo[localIndex].slot->taint_offset : localinfo[localIndex].slot->offset);
+	}
+}
+
+static void generateTaintBranchLocal (int localIndex)
+{
+	RegMem rmLocal = GetTaintLocalRM2 (localIndex, true);
+	genTaintCombine (RM_TAINT_CONTEXT, rmLocal);
+}
+
+static void generateTaintBranchStack (int depth)
+{
+	RegMem rmLocal;
+	rmLocal = GetLocalRM (SLOT2LOCALOFFSET_TAINT ((-depth) + stackno - maxArgs));
+	genTaintCombine (RM_TAINT_CONTEXT, rmLocal);
+}
+
+#ifdef TRISHUL_FALLBACK
+static taint_t fallbackTaint;
+#endif
+
+void trishulSetFallbackContext (taint_t context)
+{
+#ifdef TRISHUL_FALLBACK
+	fallbackTaint = context;
+#endif
+}
+
+void trishulAddFallbackContext (taint_t context)
+{
+#ifdef TRISHUL_FALLBACK
+	taintAdd1 (fallbackTaint, context);
+#endif
+}
+
+taint_t trishulGetFallbackContext ()
+{
+#ifdef TRISHUL_FALLBACK
+	return fallbackTaint;
+#else
+	return 0;
+#endif
+}
+
+static void generateTaintBranch (uint case_taken)
+{
+	debug (("TAINT BRANCH: %d\n", case_taken));
+	assert (case_taken < currentContext->store_case_count);
+
+	if (globalMethod->context_failed)
+	{
+		/* Fallback mode */
+#ifdef TRISHUL_FALLBACK
+		if (!(globalMethod->noTaintFlags & TRISHUL_NOTAINT_FALLBACK))
+		{
+			debug (("TAINT FALLBACK\n"));
+			RegMem rmStatic = GetFixedRM (&fallbackTaint);
+			genTaintCombine (RM_TAINT_CONTEXT, rmStatic);
+		}
+#endif
+	}
+	else
+	{
+		const StorageRecord *stores = &currentContext->store_cases[case_taken];
+		const StorageEntry  *entry;
+		if (!STORAGE_IS_EMPTY (stores) || stores->has_throw)
+		{
+			if (stores->has_throw)
+			{
+				genTaintCombine (RM_TAINT_CONTEXT, RM_TAINT_NOTHROW);
+			}
+
+			/* Taint any locals */
+			if (stores->quick_locals)
+			{
+				uint i;
+				for (i = 0; i < sizeof (stores->quick_locals) * 8; i++)
+				{
+					if (stores->quick_locals & (1 << i))
+					{
+						generateTaintBranchLocal (i);
+					}
+				}
+			}
+
+			/* Handle other entries */
+			for (entry = stores->first; entry; entry = entry->next)
+			{
+				switch (entry->type)
+				{
+				case STORE_LOCAL_VARIABLE:
+					generateTaintBranchLocal (entry->param.local.index);
+					break;
+				case STORE_FIELD_STATIC:
+					if (!entry->param.field_static.field->noTaint)
+					{
+						RegMem rmStatic = GetFixedRM (&entry->param.field_static.field->trishul.taint);
+						genTaintCombine (RM_TAINT_CONTEXT, rmStatic);
+					}
+					break;
+				case STORE_STACK:
+					if (entry->param.stack.depth < 0)
+					{
+						generateTaintBranchStack (entry->param.stack.depth);
+					}
+					break;
+				case STORE_FIELD_OBJECT:
+					if (!entry->param.field_object.field->noTaint &&
+						/* Only taint if the object reference is actually in the slot */
+						entry->param.field_object.pc_this <= currentContext->pc_end + 1)
+					{
+						RegMem rmThis = GetTaintLocalRM2 (entry->param.field_object.index_this, false);
+						RegMem rmTemp = GetRegisterRM (NOREGISTER);
+						if (regMemIsIndirect (&rmThis))
+						{
+							// Load this pointer into register
+							rmTemp.reg = REG_edi;
+							genPush (&rmTemp);
+							genMov (&rmThis, &rmTemp);
+							rmThis = rmTemp;
+						}
+
+						genCmp  (&rmThis, &RM_NULL);
+						JumpLabel lSkipUpdate = genJumpCond (&JE);
+						taint_object_store_impl (&rmThis, entry->param.field_object.field->trishul.taint_index, NULL);
+						setJumpTarget (lSkipUpdate);
+
+						if (rmTemp.reg != NOREGISTER)
+						{
+							genPop (&rmTemp);
+						}
+					}
+					break;
+				default:
+					/* Unimplemented type */
+					abort ();
+				}
+			}
+		}
+	}
+}
+
+typedef struct _BranchType
+{
+	uint8						condCode;
+	const char					*name;
+	const struct _BranchType	*invert;
+} BranchType;
+
+static const BranchType BRANCH_TYPES[13] =
+{
+	{0, 	NULL, 		NULL}, 					// ba			= 0,	/* Always */
+	{0x84,	"je",		&BRANCH_TYPES[bne]}, 	// beq			= 1,	/* Equal */
+	{0x8C,	"jlt",		&BRANCH_TYPES[bge]},	// blt			= 2,	/* Less than */
+	{0x8E,	"jle",		&BRANCH_TYPES[bgt]},	// ble			= 3,	/* Less than or equal */
+	{0x8F,	"jgt",		&BRANCH_TYPES[ble]},	// bgt			= 4,	/* Greater than */
+	{0x8D,	"jge",		&BRANCH_TYPES[blt]},	// bge			= 5,	/* Greater than or equal */
+	{0x85,	"jne",		&BRANCH_TYPES[beq]}, 	// bne			= 6,	/* Not equal */
+	{0, 	NULL, 		NULL}, 					// bn			= 7,	/* Never */
+	{0, 	NULL, 		NULL}, 					// bindirect	= 8,	/* Indirect */
+	{0x82,	"jult",		&BRANCH_TYPES[buge]}, 	// bult			= 9,	/* Unsigned less than */
+	{0x83,	"juge",		&BRANCH_TYPES[bult]}, 	// buge			= 10,	/* Unsigned greater than or equal */
+	{0x87,	"jugt",		&BRANCH_TYPES[bule]}, 	// bugt			= 11,	/* Unsigned greater than */
+	{0x86,	"jule",		&BRANCH_TYPES[bugt]},	// bule			= 12,	/* Unsigned less than or equal than */
+};
+
+static void generateBranch (int bt, label *l)
+{
+	const BranchType *branch = &BRANCH_TYPES[bt & ~branch_flag_notaint];
+
+	if (bt & branch_flag_notaint)
+	{
+		OUT(0x0F);
+		OUT(branch->condCode);
+		l->at = CODEPC;
+		LOUT(0);
+		l->from = CODEPC;
+		debug(("%s %s\n", branch->name, KaffeJIT3_getLabelName(l)));
+	}
+	else
+	{
+		debug(("TAINT BRANCH: %s TMP\n", branch->invert->name));
+		OUT(0x0F);
+		OUT(branch->invert->condCode);
+		uint fixAddress = CODEPC;
+		LOUT(0);
+
+		generateTaintBranch (1);
+
+		debug(("jmpl %s\n", KaffeJIT3_getLabelName(l)));
+		OUT(0xE9);
+		l->at = CODEPC;
+		LOUT(0);
+		l->from = CODEPC;
+
+		// Fix the branch target
+		*(uint32*)&codeblock[fixAddress] = CODEPC - fixAddress - 4;
+
+		generateTaintBranch (0);
+	}
+}
+
+define_insn(branch, branch_xCC)
+{
+	/* to handle non-taken branches, generally 'je label' becomes
+	 *
+	 * jne tmp
+	 * branch (true)
+	 * jmp label
+	 * tmp:
+	 * branch (false)
+	 */
+
+
+	label* l = const_label(1);
+	int bt = const_int(2);
+
+	l->type |= Llong|Lrelative;
+	switch (bt & ~branch_flag_notaint) {
+	case ba:
+		OUT(0xE9);
+		l->at = CODEPC;
+		LOUT(0);
+		l->from = CODEPC;
+		debug(("jmpl %s\n", KaffeJIT3_getLabelName(l)));
+		break;
+	case beq:
+	case bne:
+	case blt:
+	case ble:
+	case bgt:
+	case bge:
+	case bult:
+	case bugt:
+	case buge:
+		generateBranch (bt, l);
+		break;
+	default:
+		KAFFEVM_ABORT();
+	}
+}
+
+define_insn(branch_indirect, branch_indirect_xRC)
+{
+	int r = rreg_int(1);
+	assert(const_int(2) == ba);
+
+	OUT(0xFF);
+	OUT(0xE0|r);
+
+	debug(("jmp (%s)\n", regname(r)));
+}
+
+define_insn(call_ref, call_xCC)
+{
+	TRAP(CALL_REF);
+
+	debug(("call ?\n"));
+
+	label* l = const_label(1);
+
+#if defined(KAFFE_PROFILER)
+	if (profFlag && !(l->type & Lnoprofile)) {
+		/*  don't profile call_soft */
+		profiler_start(globalMethod->totalChildrenClicks, 1);
+	}
+#endif
+
+	OUT(0xE8);
+	l->type |= Llong|Lrelative;
+	l->at = CODEPC;
+	LOUT(0);
+	l->from = CODEPC;
+
+#if defined(KAFFE_PROFILER)
+	if (profFlag && !(l->type & Lnoprofile)) {
+		/*  don't profile call_soft */
+		profiler_end(globalMethod->totalChildrenClicks, 1);
+	}
+#endif
+}
+
+#ifndef TRISHUL_MEASURE_NO_POLYMER
+
+#define POLYMER_WRAPPER_TYPE	double
+#define POLYMER_WRAPPER_NAME	polymerWrapperD
+#define POLYMER_WRAPPER_INVOKE	retval.d = func ();
+#define POLYMER_WRAPPER_RETURN	nativeRetValSetTaint ('D', retval.taint); return retval.d;
+#include "polymerWrapper.c"
+#undef POLYMER_WRAPPER_TYPE
+#undef POLYMER_WRAPPER_NAME
+#undef POLYMER_WRAPPER_INVOKE
+#undef POLYMER_WRAPPER_RETURN
+
+#define POLYMER_WRAPPER_TYPE	float
+#define POLYMER_WRAPPER_NAME	polymerWrapperF
+#define POLYMER_WRAPPER_INVOKE	retval.f = func ();
+#define POLYMER_WRAPPER_RETURN	nativeRetValSetTaint ('F', retval.taint); return retval.f;
+#include "polymerWrapper.c"
+#undef POLYMER_WRAPPER_TYPE
+#undef POLYMER_WRAPPER_NAME
+#undef POLYMER_WRAPPER_INVOKE
+#undef POLYMER_WRAPPER_RETURN
+
+#define POLYMER_WRAPPER_TYPE	long
+#define POLYMER_WRAPPER_NAME	polymerWrapperJ
+#define POLYMER_WRAPPER_INVOKE	retval.j = func ();
+#define POLYMER_WRAPPER_RETURN	nativeRetValSetTaint ('J', retval.taint); return retval.j;
+#include "polymerWrapper.c"
+#undef POLYMER_WRAPPER_TYPE
+#undef POLYMER_WRAPPER_NAME
+#undef POLYMER_WRAPPER_INVOKE
+#undef POLYMER_WRAPPER_RETURN
+
+#define POLYMER_WRAPPER_TYPE	void
+#define POLYMER_WRAPPER_NAME	polymerWrapperV
+#define POLYMER_WRAPPER_INVOKE	func ();
+#define POLYMER_WRAPPER_RETURN
+#include "polymerWrapper.c"
+#undef POLYMER_WRAPPER_TYPE
+#undef POLYMER_WRAPPER_NAME
+#undef POLYMER_WRAPPER_INVOKE
+#undef POLYMER_WRAPPER_RETURN
+
+#define POLYMER_WRAPPER_TYPE	void *
+#define POLYMER_WRAPPER_NAME	polymerWrapperL
+#define POLYMER_WRAPPER_INVOKE	retval.l = func ();
+#define POLYMER_WRAPPER_RETURN	nativeRetValSetTaint ('L', retval.taint); return retval.l;
+#include "polymerWrapper.c"
+#undef POLYMER_WRAPPER_TYPE
+#undef POLYMER_WRAPPER_NAME
+#undef POLYMER_WRAPPER_INVOKE
+#undef POLYMER_WRAPPER_RETURN
+
+#endif
+
+static void genMovCond (const RegMem *src, const RegMem *dst, const JumpType *type)
+{
+	assert (!regMemIsIndirect (dst) && !regMemIsConstant (dst));
+	debug (("TAINT: cmov%s %s, %s\n", type->name, debugRegMem (src), debugRegMem (dst)));
+	OUT (0x0F); OUT (0x40 | type->opcode);
+	genRM (dst->reg, src, false);
+}
+
+#ifndef TRISHUL_MEASURE_NO_POLYMER
+static JumpLabel polymerPrefix (const Method *method, const RegMem *rmTarget, uint argSize)
+{
+	bool isVirtual = !(method->accflags & ACC_STATIC) && !(method->accflags & ACC_FINAL);
+	RegMem rmArgSize	 		= GetConstantRM	(argSize);
+	// Update polymer filters if required
+	debug (("POLYMER CHECK UPDATE +++++ %s\n", isVirtual ? "VIRTUAL" : "FINAL"));
+
+	// Do not use EAX as temporary, that will overwrite any return value
+	RegMem rmActualMethod = getTemporaryRM2 (rmTarget, &REGISTER_RM[REG_eax]);
+	genPush (&rmActualMethod);
+
+	// If the method is virtual, it might not be the method that will actually be invoked.
+	// To find the actual method after polymorphism (i.e. the one that will be invoked, whereas the specified method
+	// is the declaration in the base class), there are two possibilites:
+	// 1) The call points to the actual code. In this case the code is preceded by a jitCodeHeader (jit3/machine.h).
+	// 2) The call points to a trampoline. In this case the code is preceded by a methodTrampoline (i386/jit.h).
+	// Either way, the structure can be used to retrieve the method. Case 2) is detected by checking if func
+	// points to a call instruction (0xE8, call relative). The address is not checked, as other code
+	// will not start with this instruction, but with code to setup the environmet
+	if (isVirtual)
+	{
+		RegMem rmActualMethodInd = GetRegMem (rmActualMethod.reg, 0, FLAG_IS_INDIRECT);
+		RegMem rmCallInstruction = GetConstantRM (0xE8);
+
+		genMov (rmTarget, &rmActualMethod); 		// rmActualMethod now contains method address
+		genCmp8 (&rmActualMethodInd, &rmCallInstruction);
+
+		// If equal, use the trampoline offset
+		int offsetTrampoline = (int) &((methodTrampoline *) NULL)->meth;
+		RegMem rmIndTramp = GetRegMem (rmActualMethod.reg, offsetTrampoline, FLAG_IS_INDIRECT);
+		genMovCond (&rmIndTramp, &rmActualMethod, &JE);
+
+		// If not equal, use the jitCodeHeader offset
+		int offsetJitHeader  = -sizeof (jitCodeHeader) + (int) &((jitCodeHeader *) NULL)->method;
+		RegMem rmIndJit = GetRegMem (rmActualMethod.reg, offsetJitHeader, FLAG_IS_INDIRECT);
+		genMovCond (&rmIndJit, &rmActualMethod, &JNE);
+	}
+	else
+	{
+		RegMem rmFinalMethod = GetConstantRM ((uint) method);
+		genMov (&rmFinalMethod, &rmActualMethod);
+	}
+	// Currently, the actual method is rmActualMethod
+
+	RegMem rmMethodIteration 	= GetRegMem 	(rmActualMethod.reg,
+												(int) &((Method *) NULL)->polymerIterationChecked, FLAG_IS_INDIRECT);
+	RegMem rmCurrentIteration 	= GetFixedRM 	(&polymerIteration);
+
+	RegMem rmTemp2				= GetRegisterRM (REG_esi);
+	genPush (&rmTemp2);
+
+	genMov  (&rmCurrentIteration, &rmTemp2);
+	genCmp  (&rmTemp2, &rmMethodIteration);
+
+	genPop	(&rmTemp2); // Pop does not affect flags
+
+	JumpLabel lSkipUpdate = genJumpCond (&JGE);
+
+	TRAP (POLYMER_UPDATE);
+
+	genPush 	(&rmActualMethod);
+	genCall 	("POLYMER: polymerCheckFiltersWrapper (meth)", polymerCheckFiltersWrapper);
+	genAddConst	(4, &REGISTER_RM[REG_esp]);
+
+	setJumpTarget (lSkipUpdate);
+
+	// Check if the method requires a polymer invocation
+
+	debug (("POLYMER ++++: %s.%s %s\n", CLASS_CNAME(method->class), METHOD_NAMED (method), METHOD_SIGD (method)));
+
+	RegMem rmMethodMatch = GetRegMem (rmActualMethod.reg, (int) &((Method *) NULL)->polymerMatch, FLAG_IS_INDIRECT);
+	genCmp (&rmMethodMatch, &RM_NULL);
+	JumpLabel lSkipPolymer = genJumpCond (&JE);
+
+	TRAP (POLYMER);
+
+	// Do not push all. This causes the return value to be stored, which might be replaced.
+	// The required registers are saved in polymerWrapper
+	genPush		(&rmArgSize);
+	genPush		(&rmActualMethod);
+	genPush		(rmTarget);
+	switch (METHOD_RET_TYPE (method)[0])
+	{
+	case 'D':	genCall	("polymerWrapperD", polymerWrapperD); break;
+	case 'F':	genCall	("polymerWrapperF", polymerWrapperF); break;
+	case 'J':	genCall	("polymerWrapperJ", polymerWrapperJ); break;
+	case 'V':	genCall	("polymerWrapperV", polymerWrapperV); break;
+	default:	genCall	("polymerWrapperL", polymerWrapperL); break;
+	}
+	genAddConst	(12, &REGISTER_RM[REG_esp]);
+	genPop	(&rmActualMethod);
+
+	JumpLabel lSkipCall = genJump ();
+	setJumpTarget (lSkipPolymer);
+	genPop	(&rmActualMethod);
+	return lSkipCall;
+}
+
+static void polymerPostfix (JumpLabel lSkipCall)
+{
+	setJumpTarget (lSkipCall);
+	debug (("POLYMER ----\n"));
+}
+#endif
+
+define_insn(call, call_xRC)
+{
+	int 			r 			= rreg_int(1);
+	RegMem 			rmTarget	= GetRegMem (r, 0, 0);
+	const Method 	*method 	= (Method *) const_int (3);
+	uint			argCount	= const_int (2);
+	assert (method);
+
+#if defined(KAFFE_PROFILER)
+	if (profFlag) {
+		profiler_start(globalMethod->totalChildrenClicks, 1);
+	}
+#endif
+
+#ifndef TRISHUL_MEASURE_NO_POLYMER
+	JumpLabel polymerLabel = polymerPrefix (method, &rmTarget, argCount * sizeof (uint));
+#endif
+
+	OUT(0xFF);
+	OUT(0xD0|r);
+	debug(("call %s\n", regname(r)));
+
+#ifndef TRISHUL_MEASURE_NO_POLYMER
+	polymerPostfix (polymerLabel);
+#endif
+
+#if defined(KAFFE_PROFILER)
+	if (profFlag) {
+		profiler_end(globalMethod->totalChildrenClicks, 1);
+	}
+#endif
+}
+
+define_insn(call_indirect_const, call_ind_xCC)
+{
+	TRAP(CALL);
+
+	int 			m 			= const_int(1);
+	RegMem 			rmTarget	= GetFixedRM ((void *) m);
+	const Method 	*method 	= (Method *) const_int (3);
+	uint			argCount	= const_int (2);
+	assert (method);
+
+#if defined(KAFFE_PROFILER)
+	if (profFlag) {
+		profiler_start(globalMethod->totalChildrenClicks, 1);
+	}
+#endif
+
+#ifndef TRISHUL_MEASURE_NO_POLYMER
+ 	JumpLabel polymerLabel = polymerPrefix (method, &rmTarget, argCount * sizeof (uint));
+#endif
+	WOUT(0x15FF);
+	LOUT(m);
+	debug(("call *%x\n", m));
+
+#ifndef TRISHUL_MEASURE_NO_POLYMER
+ 	polymerPostfix (polymerLabel);
+#endif
+
+#if defined(KAFFE_PROFILER)
+	if (profFlag) {
+		profiler_end(globalMethod->totalChildrenClicks, 1);
+	}
+#endif
+}
+
+define_insn(push_int, push_xRC)
+{
+	int r;
+
+	if (inRegister(1, Rint|Rref)) {
+		r = rreg_int(1);
+
+		if (const_int(3))
+		{
+			// Push taint onto stack
+			genTaintRegPush (rreg_int(1));
+		}
+		else
+		{
+			OUT(0x50|r);
+
+			debug(("pushl %s\n", regname(r)));
+		}
+	}
+	else {
+		r = rslot_int(1);
+
+		if (const_int(3))
+		{
+			// On stack
+
+			OUT(0xFF);
+			OUT(0xB5);
+			LOUT(slot_taint (1));
+			debug(("TAINT: pushl %d(ebp)\n", slot_taint (1)));
+		}
+		else
+		{
+			OUT(0xFF);
+			OUT(0xB5);
+			LOUT(r);
+			debug(("pushl %d(ebp)\n", r));
+		}
+	}
+}
+
+define_insn(push_int_const, push_xCC)
+{
+	int v = const_int(1);
+
+	if (const_int(3))
+	{
+		OUT(0x68);
+		LOUT(0);
+		debug(("TAINT: constarg : pushl #0\n"));
+	}
+	else
+	{
+		OUT(0x68);
+		LOUT(v);
+
+		debug(("pushl #x%X\n", v));
+	}
+}
+
+
+define_insn(push_float, fpush_xRC)
+{
+	int r = rreg_int(1);	/* Move the float into a register */
+
+	if (const_int(3))
+	{
+		// Push taint onto stack
+		genTaintRegPush (rreg_int(1));
+	}
+	else
+	{
+		OUT(0x50|r);
+
+		debug(("pushl %s\n", regname(r)));
+	}
+}
+
+define_insn(push_double, fpushl_xRC)
+{
+	int o = rslot_double(1);
+
+	if (const_int(3))
+	{
+		// Push taint onto stack
+		OUT(0x68);
+		LOUT(0xFFFFFFFF);
+		debug(("TAINT: pushl DOUBLE 1 dummy\n"));
+
+		RegMem rm = GetLocalRM (slotOffsetNoSpillTaint(seq_slot (s, 1), Rdouble));
+		genRM2XMM_ZEROED 	(&rm, XMM_SCRATCH);
+		genTaintXMM2Stack 	(&XMM_SCRATCH_PART0);
+		debug(("TAINT: pushl DOUBLE 2\n"));
+	}
+	else
+	{
+		OUT(0xFF);
+		OUT(0xB0|REG_ebp);
+		LOUT(o+4);
+
+		debug(("pushl %d(ebp)\n", (o+4)));
+
+		OUT(0xFF);
+		OUT(0xB0|REG_ebp);
+		LOUT(o);
+
+		debug(("pushl %d(ebp)\n", o));
+	}
+}
+
+define_insn(do_pushtaint_arg_marker, do_pushtaint_arg_marker)
+{
+	// mov %esp, argumentStackMarker
+	OUT (0x89); OUT (0x25); LOUT ((uint) &argumentStackMarker);
+	debug(("TAINT: push arg marker\n"));
+}
+
+define_insn(popargs, popargs_xxC)
+{
+	int o1 = const_int(2);
+	int o = o1 * 4;
+
+	OUT(0x81);
+	OUT(0xC0|REG_esp);
+	LOUT(o);
+
+	debug(("addl %d,esp\n", o));
+
+	TRAP(POPARGS);
+}
+
+define_insn(return_int, return_Rxx)
+{
+DBG(REGFORCE,
+    dprintf ("return_int()\n");
+    );
+	set_slot_register(seq_dst(s), REG_eax, Rint);
+}
+
+define_insn(return_long, returnl_Rxx)
+{
+DBG(REGFORCE,
+    dprintf ("return_long()\n");
+    );
+	set_slot_register(seq_dst(s), REG_eax, Rint);
+	set_slot_register(seq_dst(s)+1, REG_edx, Rint);
+}
+
+define_insn(return_float, freturn_Rxx)
+{
+DBG(REGFORCE,
+    dprintf ("return_float()\n");
+    );
+	set_slot_register(seq_dst(s), REG_flt0, Rfloat);
+}
+
+define_insn(return_double, freturnl_Rxx)
+{
+DBG(REGFORCE,
+    dprintf ("return_double()\n");
+    );
+	set_slot_register(seq_dst(s), REG_dbl0, Rdouble);
+}
+
+define_insn(returnarg_int, returnarg_xxR)
+{
+	int r;
+
+	r = rreg_int(2);
+	do_move_int(REG_eax, r);
+
+	genTaintCombine (RM_TAINT_CONTEXT, GetRegisterRM (REG_eax));
+}
+
+define_insn(returnarg_long, returnargl_xxR)
+{
+	REGSLOT* r;
+	int r1;
+	int r2;
+
+	r = seq_slot(s, 2);
+	r1 = _slowSlotRegister(r, Rint, rread);
+	r2 = _slowSlotRegister(r+1, Rint, rread);
+
+	/* Return long is a bit complicated since part of the source may
+	 * be the destination.
+	 */
+	if (REG_eax != r2) {
+		do_move_int(REG_eax, r1);
+		do_move_int(REG_edx, r2);
+	}
+	else if (REG_edx != r1) {
+		do_move_int(REG_edx, r2);
+		do_move_int(REG_eax, r1);
+	}
+	else {
+		/* r1 == REG_edx && r2 == REG_eax - swap */
+		OUT(0x87);
+		OUT(0xC0|r1<<3|r2);
+	}
+}
+
+define_insn(returnarg_float, freturnarg_xxR)
+{
+	/* Force value into float register */
+	rreg_float(2);
+}
+
+define_insn(returnarg_double, freturnargl_xxR)
+{
+	/* Force value into double register */
+	rreg_double(2);
+}
+
+/* --------------------------------------------------------------------- */
+
+define_insn(add_int_const, add_RRC)
+{
+	int rw;
+	int v;
+
+	check_reg_01();
+
+	v = const_int(2);
+	rw = rwreg_int(0);
+
+	OUT(0x81);
+	OUT(0xC0|rw);
+	LOUT(v);
+
+	debug(("addl #%d,%s\n", v, regname(rw)));
+
+	genTaintCombine (RM_TAINT_CONTEXT, GetRegisterRM (rw));
+}
+
+define_insn(sub_int_const, sub_RRC)
+{
+	int rw;
+	int v;
+
+	check_reg_01();
+
+	v = const_int(2);
+	rw = rwreg_int(0);
+
+	OUT(0x81);
+	OUT(0xE8|rw);
+	LOUT(v);
+
+	debug(("subl #%d,%s\n", v, regname(rw)));
+
+	genTaintCombine (RM_TAINT_CONTEXT, GetRegisterRM (rw));
+}
+
+define_insn(do_load_array_length, do_load_array_length)
+{
+	// Like load_offset_int, but include array taint
+
+	int v = const_int(3);
+	int r = rreg_int(1);
+	int w = wreg_int(0);
+
+	assert(r != REG_esp);
+	OUT(0x8B);
+	OUT(0x80|(w<<3)|r);
+	LOUT(v);
+
+	debug(("movl %d(%s),%s\n", v, regname(r), regname(w)));
+	genTaintPropagate (GetRegisterRM (r), GetRegisterRM (w));
+
+	RegMem rmArrayTaint = GetRegMem (r, OFFSET_OBJECT_TAINT, FLAG_IS_INDIRECT);
+	RegMem rmDst		= GetRegisterRM (w);
+	genTaintCombine (rmArrayTaint, rmDst);
+
+}
+
+define_insn(load_offset_int, load_RRC)
+{
+	int v = const_int(2);
+	int r = rreg_int(1);
+	int w = wreg_int(0);
+
+	assert(r != REG_esp);
+	OUT(0x8B);
+	OUT(0x80|(w<<3)|r);
+	LOUT(v);
+
+	debug(("movl %d(%s),%s\n", v, regname(r), regname(w)));
+	genTaintPropagate (GetRegisterRM (r), GetRegisterRM (w));
+}
+
+define_insn(load_byte, loadb_RxR)
+{
+	int r = rreg_int(2);
+	int w = wreg_int(0);
+
+	OUT(0x0F);
+	OUT(0xBE);
+	OUT(0x00|(w<<3)|r);
+	if (r == REG_esp) {
+		OUT(0x20|REG_esp);
+	}
+
+	debug(("movsb (%s),%s\n", regname(r), regname(w)));
+	genTaintPropagate (GetRegisterRM (r), GetRegisterRM (w));
+}
+
+define_insn(load_char, loadc_RxR)
+{
+	int r = rreg_int(2);
+	int w = wreg_int(0);
+
+	OUT(0x0F);
+	OUT(0xB7);
+	OUT(0x00|(w<<3)|r);
+	if (r == REG_esp) {
+		OUT(0x20|REG_esp);
+	}
+
+	debug(("movzw (%s),%s\n", regname(r), regname(w)));
+	genTaintPropagate (GetRegisterRM (r), GetRegisterRM (w));
+}
+
+define_insn(load_short, loads_RxR)
+{
+	int r = rreg_int(2);
+	int w = wreg_int(0);
+
+	OUT(0x0F);
+	OUT(0xBF);
+	OUT(0x00|(w<<3)|r);
+	if (r == REG_esp) {
+		OUT(0x20|REG_esp);
+	}
+
+	debug(("movsw (%s),%s\n", regname(r), regname(w)));
+	genTaintPropagate (GetRegisterRM (r), GetRegisterRM (w));
+}
+
+define_insn(store_offset_int, store_xRRC)
+{
+	int v;
+	int r1;
+	int r0;
+
+	v = const_int(2);
+	r0 = rreg_int(0);
+	r1 = rreg_int(1);
+
+	assert(r0 != REG_esp);
+	OUT(0x89);
+	OUT(0x80|(r0<<3)|r1);
+	LOUT(v);
+
+	debug(("movl %s,%d(%s)\n", regname(r0), v, regname(r1)));
+}
+
+define_insn(store_byte, storeb_xRR)
+{
+	int r;
+	int w;
+
+	/* Can only store accumulators as bytes */
+	r = rreg_subint(2);
+	/* If we cannot get the register into the subint
+	 * (it's probably global) then do it ourselves.
+	 */
+	if (r == NOREG) {
+		r = rreg_int(2);
+		safe_move_int(REG_eax, r);
+	}
+
+	w = rreg_int(1);
+
+	OUT(0x88);
+	OUT(0x00|(r<<3)|w);
+	if (w == REG_esp) {
+		OUT(0x20|REG_esp);
+	}
+
+	debug(("movb %s,(%s)\n", regname(r), regname(w)));
+}
+
+define_insn(store_short, stores_xRR)
+{
+	int r = rreg_int(2);
+	int w = rreg_int(1);
+
+	OUT(0x66);
+	OUT(0x89);
+	OUT(0x00|(r<<3)|w);
+	if (w == REG_esp) {
+		OUT(0x20|REG_esp);
+	}
+
+	debug(("movw %s,(%s)\n", regname(r), regname(w)));
+}
+
+define_insn(cmp_int_const, cmp_xRC)
+{
+	int r1 = rreg_int(1);
+	int v = const_int(2);
+
+	// TODO: how come this is invoked if the test below fails? Is it generated code?
+	if (currentContext && currentContext->bitmap_index >= 0)
+	{
+		genTaintPropagate (GetRegisterRM (r1), GetContextRM (currentContext->bitmap_index + 1));
+		// Include in the current context taint, so that it is available when the non-taken branch is updated.
+		// TODO: this can be skipped if the non-taken branch is scheduled better
+		genTaintCombine (GetRegisterRM (r1), RM_TAINT_CONTEXT);
+	}
+
+	OUT(0x81);
+	OUT(0xF8|r1);
+	LOUT(v);
+
+	debug(("cmpl #%d,%s\n", v, regname(r1)));
+}
+
+define_insn(lshl_int_const, lshl_RRC)
+{
+	int rw;
+	int v;
+
+	check_reg_01();
+
+	rw = rreg_int(0);
+	v = const_int(2);
+
+	OUT(0xC1);
+	OUT(0xE0|rw);
+	OUT(v);
+
+	debug(("shll #%d,%s\n", v, regname(rw)));
+}
+
+define_insn(mon_enter, monenter_xxRCC)
+{
+	Method* meth;
+	label* l;
+	int r;
+
+	meth = (Method*)const_int(3);
+	l = const_label(4);
+
+	clobberRegister(REG_eax);
+	clobberRegister(REG_ecx);
+
+	if (meth == 0) {
+		r = rreg_int(2);
+
+		OUT(0x8b);
+		OUT(0x40|r);
+		OUT(0x04;        debug(("movl   0x4(REG),eax\n")));
+		OUT(0x85);
+		OUT(0xc0;        debug(("testl  eax,eax\n")));
+		OUT(0x75);
+		OUT(0x0b;        debug(("jne    12 <start+12>\n")));
+		OUT(0x89);
+		OUT(0xe9;        debug(("movl   ebp,ecx\n")));
+		OUT(0xF0;	   debug(("lock")));
+		OUT(0x0f);
+		OUT(0xb1);
+		OUT(0x48|r);
+		OUT(0x04;        debug(("cmpxchgl ecx,0x4(REG)\n")));
+		OUT(0x74);
+		OUT(0x15;        debug(("je     27 <start+27>\n")));
+		OUT(0x75);
+		OUT(0x09;        debug(("jne    1a <start+1a>\n")));
+		OUT(0x29);
+		OUT(0xe8;        debug(("subl   ebp,eax\n")));
+		OUT(0x3d);
+		LOUT(0x400;      debug(("cmpl   $0x400,eax\n")));
+		OUT(0x72);
+		OUT(0x0a;        debug(("jb     27 <start+27>\n")));
+		OUT(0x55;        debug(("pushl  ebp\n")));
+		OUT(0x50|r;      debug(("pushl  REG\n")));
+		OUT(0xe8);
+		l->type |= Llong|Lrelative;
+		l->at = CODEPC;
+		LOUT(0;	   debug(("call   slowLockObject\n")));
+		l->from = CODEPC;
+		OUT(0x83);
+		OUT(0xc4);
+		OUT(0x08;        debug(("addl   $0x8,esp\n")));
+	}
+	else {
+		OUT(0xa1);
+		LOUT((uintp)&meth->class->head.lock);
+				   debug(("movl   ?,eax\n"));
+		OUT(0x85);
+		OUT(0xc0;        debug(("testl  eax,eax\n")));
+		OUT(0x75);
+		OUT(0x0e;        debug(("jne    17 <start+17>\n")));
+		OUT(0x89);
+		OUT(0xe9;	   debug(("movl   ebp,ecx\n")));
+		OUT(0xF0;	   debug(("lock")));
+		OUT(0x0f);
+		OUT(0xb1);
+		OUT(0x0d);
+		LOUT((uintp)&meth->class->head.lock);
+				   debug(("cmpxchgl ecx,?\n"));
+		OUT(0x74);
+		OUT(0x19;        debug(("je     2d <start+2d>\n")));
+		OUT(0x75);
+		OUT(0x09;        debug(("jne    1f <start+1f>\n")));
+		OUT(0x29);
+		OUT(0xe8;        debug(("subl   ebp,eax\n")));
+		OUT(0x3d);
+		LOUT(0x400;      debug(("cmpl   $0x400,eax\n")));
+		OUT(0x72);
+		OUT(0x0e;        debug(("jb     2d <start+2d>\n")));
+		OUT(0x55;        debug(("pushl  ebp\n")));
+		OUT(0x68);
+		LOUT((uintp)meth->class);
+				   debug(("pushl  $?\n"));
+		OUT(0xe8);
+		l->type |= Llong|Lrelative;
+		l->at = CODEPC;
+		LOUT(0;	   debug(("call   slowLockObject\n")));
+		l->from = CODEPC;
+		OUT(0x83);
+		OUT(0xc4);
+		OUT(0x08;        debug(("addl   $0x4,esp\n")));
+	}
+}
+
+define_insn(mon_exit, monexit_xxRCC)
+{
+	Method* meth;
+	label* l;
+	int r;
+
+	meth = (Method*)const_int(3);
+	l = const_label(4);
+
+	clobberRegister(REG_eax);
+	clobberRegister(REG_ecx);
+
+	if (meth == 0) {
+		r = rreg_int(2);
+
+		OUT(0x8b);
+		OUT(0x40|r);
+		OUT(0x04;        debug(("movl   0x4(REG),eax\n")));
+		OUT(0xa9);
+		LOUT(0x01;	   debug(("testl  $0x1,eax\n")));
+		OUT(0x75);
+		OUT(0x0d;        debug(("jne    17\n")));
+		OUT(0x39);
+		OUT(0xc5;        debug(("cmpl   eax,ebp\n")));
+		OUT(0x75);
+		OUT(0x13;        debug(("jne    24\n")));
+		OUT(0x31);
+		OUT(0xc9;        debug(("xorl   ecx,ecx\n")));
+		OUT(0xF0;	   debug(("lock")));
+		OUT(0x0f);
+		OUT(0xb1);
+		OUT(0x48|r);
+		OUT(0x04;        debug(("cmpxchgl ecx,0x4(REG)\n")));
+		OUT(0x74);
+		OUT(0x0a;        debug(("je     23\n")));
+		OUT(0x55;        debug(("pushl  ebp\n")));
+		OUT(0x50|r;      debug(("pushl  REG\n")));
+		OUT(0xe8);
+		l->type |= Llong|Lrelative;
+		l->at = CODEPC;
+		LOUT(0;	   debug(("call   slowUnlockObject\n")));
+		l->from = CODEPC;
+		OUT(0x83);
+		OUT(0xc4);
+		OUT(0x08;        debug(("addl   $0x8,esp\n")));
+	}
+	else {
+		OUT(0xa1);
+		LOUT((uintp)&meth->class->head.lock);
+				   debug(("movl   ?,eax\n"));
+		OUT(0xa9);
+		LOUT(0x01;	   debug(("testl  $0x1,eax\n")));
+		OUT(0x75);
+		OUT(0x10;        debug(("jne    1c\n")));
+		OUT(0x39);
+		OUT(0xc5;        debug(("cmpl   eax,ebp\n")));
+		OUT(0x75);
+		OUT(0x1a;        debug(("jne    2a\n")));
+		OUT(0x31);
+		OUT(0xc9;        debug(("xorl   ecx,ecx\n")));
+		OUT(0xF0;	   debug(("lock")));
+		OUT(0x0f);
+		OUT(0xb1);
+		OUT(0x0d);
+		LOUT((uintp)&meth->class->head.lock);
+				   debug(("cmpxchgl ecx,?\n"));
+		OUT(0x74);
+		OUT(0x0e;        debug(("je     29\n")));
+		OUT(0x55;        debug(("pushl  ebp\n")));
+		OUT(0x68);
+		LOUT((uintp)meth->class);
+				   debug(("pushl  $?\n"));
+		OUT(0xe8);
+		l->type |= Llong|Lrelative;
+		l->at = CODEPC;
+		LOUT(0;	   debug(("call   slowUnlockObject\n")));
+		l->from = CODEPC;
+		OUT(0x83);
+		OUT(0xc4);
+		OUT(0x08;        debug(("addl   $0x8,esp\n")));
+	}
+}
+
+define_insn(get_arg_ptr, get_arg_ptr_R)
+{
+	int rw = rwreg_int(0);
+
+	OUT(0x89);
+	OUT(0xC0|(REG_ebp<<3)|rw);
+	debug(("movl %s,%s\n", regname(REG_ebp), regname(rw)));
+
+	OUT(0x81);
+        OUT(0xC0|rw);
+	LOUT(8);
+	debug(("addl #%d,%s\n", 4, regname(rw)));
+}
+
+define_insn(and_int_const, and_RRC)
+{
+        int rw;
+        int v;
+
+        rw = rwreg_int(0);
+        v = const_int(2);
+
+        OUT(0x81);
+        OUT(0xE0|rw);
+        LOUT(v);
+
+        debug(("andl #%d,%s\n", v, regname(rw)));
+}
+
+define_insn(or_int_const, or_RRC)
+{
+        int rw;
+        int v;
+
+        rw = rwreg_int(0);
+        v = const_int(2);
+
+        OUT(0x81);
+        OUT(0xC8|rw);
+        LOUT(v);
+
+        debug(("orl #%d,%s\n", v, regname(rw)));
+}
+
+define_insn(xor_int_const, xor_RRC)
+{
+        int rw;
+        int v;
+
+        rw = rwreg_int(0);
+        v = const_int(2);
+
+        OUT(0x81);
+        OUT(0xF0|rw);
+        LOUT(v);
+
+        debug(("xorl #%d,%s\n", v, regname(rw)));
+}
+
+define_insn(mul_int_const, mul_RRC)
+{
+        int rw;
+        int v;
+
+        rw = rwreg_int(0);
+        v = const_int(2);
+
+        OUT(0x69);
+        OUT(0xC0|(rw<<3)|rw);
+        LOUT(v);
+
+        debug(("imull #%d,%s\n", v, regname(rw)));
+}
+
+define_insn(lshr_int_const, lshr_RRC)
+{
+        int rw;
+        int v;
+
+        rw = rwreg_int(0);
+        v = const_int(2);
+
+        OUT(0xC1);
+        OUT(0xE8|rw);
+        OUT(v);
+
+        debug(("shrl #%d,%s\n", v, regname(rw)));
+}
+
+define_insn(ashr_int_const, ashr_RRC)
+{
+        int rw;
+        int v;
+
+        rw = rwreg_int(0);
+        v = const_int(2);
+
+        OUT(0xC1);
+        OUT(0xF8|rw);
+        OUT(v);
+
+        debug(("sarl #%d,%s\n", v, regname(rw)));
+}
+
+define_insn(neg_int, neg_RxR)
+{
+        int r;
+	int w;
+
+        r = rreg_int(2);
+        w = wreg_int(0);
+
+	do_move_int(w, r);
+
+        OUT(0xF7);
+        OUT(0xD8|w);
+
+        debug(("negl %s\n", regname(w)));
+}
+
+define_insn(load_offset_scaled_byte, loadb_RRRC)
+{
+	int w;
+	int v;
+	int r1;
+	int r2;
+
+	r1 = rreg_int(1);
+	r2 = rreg_int(2);
+	w = wreg_int(0);
+	v = const_int(3);
+
+	assert(r1 != REG_esp);
+	assert(r2 != REG_esp);
+	OUT(0x0F);
+	OUT(0xBE);
+	OUT(0x84|w<<3);
+	OUT(r2<<3|r1);
+	LOUT(v);
+
+	debug(("movb %d(%s,%s,1),%s\n", v, regname(r1), regname(r2), regname(w)));
+}
+
+define_insn(load_offset_scaled_int, load_RRRC)
+{
+	int w;
+	int v;
+	int r1;
+	int r2;
+
+	r1 = rreg_int(1);
+	r2 = rreg_int(2);
+	w = wreg_int(0);
+	v = const_int(3);
+
+	assert(r1 != REG_esp);
+	assert(r2 != REG_esp);
+	OUT(0x8B);
+	OUT(0x84|w<<3);
+	OUT(0x80|r2<<3|r1);
+	LOUT(v);
+
+	debug(("mov %d(%s,%s,4),%s\n", v, regname(r1), regname(r2), regname(w)));
+}
+
+define_insn(load_offset_scaled_char, loadc_RRRC)
+{
+	int w;
+	int v;
+	int r1;
+	int r2;
+
+	r1 = rreg_int(1);
+	r2 = rreg_int(2);
+	w = wreg_int(0);
+	v = const_int(3);
+
+	assert(r1 != REG_esp);
+	assert(r2 != REG_esp);
+	OUT(0x0F);
+	OUT(0xB7);
+	OUT(0x84|w<<3);
+	OUT(0x40|r2<<3|r1);
+	LOUT(v);
+
+	debug(("movzw %d(%s,%s,2),%s\n", v, regname(r1), regname(r2), regname(w)));
+}
+
+define_insn(store_offset_scaled_byte, storeb_RRRC)
+{
+	int r;
+	int v;
+	int w1;
+	int w2;
+
+	r = rreg_subint(2);
+	/* If we cannot get the register into the subint
+	 * (it's probably global) then do it ourselves.
+	 */
+	if (r == NOREG) {
+		r = rreg_int(2);
+		safe_move_int(REG_eax, r);
+	}
+
+	w1 = rreg_int(0);
+	w2 = rreg_int(1);
+	v = const_int(3);
+
+	assert(w1 != REG_esp);
+	assert(w2 != REG_esp);
+	assert(r >= REG_eax && r <= REG_ebx);
+	OUT(0x88);
+	OUT(0x84|r<<3);
+	OUT(w2<<3|w1);
+	LOUT(v);
+
+	debug(("movb %s,%d(%s,%s,1)\n", regname(r), v, regname(w1), regname(w2)));
+}
+
+define_insn(store_offset_scaled_short, stores_RRRC)
+{
+	int r;
+	int v;
+	int w1;
+	int w2;
+
+	r = rreg_subint(2);
+	/* If we cannot get the register into the subint
+	 * (it's probably global) then do it ourselves.
+	 */
+	if (r == NOREG) {
+		r = rreg_int(2);
+		safe_move_int(REG_eax, r);
+	}
+
+	w1 = rreg_int(0);
+	w2 = rreg_int(1);
+	v = const_int(3);
+
+	assert(w1 != REG_esp);
+	assert(w2 != REG_esp);
+	assert(r >= REG_eax && r <= REG_ebx);
+	OUT(0x66);
+	OUT(0x89);
+	OUT(0x84|r<<3);
+	OUT(0x40|w2<<3|w1);
+	LOUT(v);
+
+	debug(("movw %s,%d(%s,%s,2)\n", regname(r), v, regname(w1), regname(w2)));
+}
+
+define_insn(store_offset_scaled_int, store_RRRC)
+{
+	int r;
+	int v;
+	int w1;
+	int w2;
+
+	r = rreg_int(2);
+	w1 = rreg_int(0);
+	w2 = rreg_int(1);
+	v = const_int(3);
+
+	assert(w1 != REG_esp);
+	assert(w2 != REG_esp);
+	OUT(0x89);
+	OUT(0x84|r<<3);
+	OUT(0x80|w2<<3|w1);
+	LOUT(v);
+
+	debug(("mov %s,%d(%s,%s,4)\n", regname(r), v, regname(w1), regname(w2)));
+}
+
+define_insn(load_addr_int, load_RxA)
+{
+	int o = const_int(2);
+	int w = wreg_int(0);
+
+	OUT(0x8B);
+	OUT(0x05|(w<<3));
+	LOUT(o);
+
+	debug(("movl 0x%x,%s\n", o, regname(w)));
+}
+
+define_insn(store_addr_int, store_xRA)
+{
+	int r = rreg_int(1);
+	int o = const_int(2);
+
+	OUT(0x89);
+	OUT(0x05|(r<<3));
+	LOUT(o);
+
+	debug(("movl %s,0x%x\n", regname(r), o));
+}
+
+define_insn(store_offset_byte, storeb_xRRC)
+{
+	int v;
+	int r1;
+	int r0;
+
+	/* Can only store accumulators as bytes */
+	r0 = rreg_subint(0);
+	/* If we cannot get the register into the subint
+	 * (it's probably global) then do it ourselves.
+	 */
+	if (r0 == NOREG) {
+		r0 = rreg_int(0);
+		safe_move_int(REG_eax, r0);
+	}
+
+	v = const_int(2);
+	r1 = rreg_int(1);
+
+	OUT(0x88);
+	OUT(0x80|(r0<<3)|r1);
+	LOUT(v);
+
+	debug(("movb %s,%d(%s)\n", regname(r0), v, regname(r1)));
+}
+
+define_insn(store_offset_short, stores_xRRC)
+{
+	int v;
+	int r1;
+	int r0;
+
+	v = const_int(2);
+	r1 = rreg_int(1);
+	r0 = rreg_int(0);
+
+	OUT(0x66);
+	OUT(0x89);
+	OUT(0x80|(r0<<3)|r1);
+	LOUT(v);
+
+	debug(("movw %s,%d(%s)\n", regname(r0), v, regname(r1)));
+}
+
+define_insn(store_const_offset_int, store_xRCC)
+{
+        int o;
+        int v;
+        int r;
+
+        r = rreg_int(0);
+        o = const_int(1);
+        v = const_int(2);
+
+	OUT(0xC7);
+	OUT(0x80|r);
+	LOUT(o);
+        LOUT(v);
+
+        debug(("movl %d,%d(%s)\n", v, o, regname(r)));
+}
+
+define_insn(store_const_offset_byte, storeb_xRCC)
+{
+        int o;
+        int v;
+        int r;
+
+        r = rreg_int(0);
+        o = const_int(1);
+        v = const_int(2);
+
+	OUT(0xC6);
+	OUT(0x80|r);
+	LOUT(o);
+        OUT(v);
+
+        debug(("movb %d,%d(%s)\n", v, o, regname(r)));
+}
+
+define_insn(store_const_offset_scaled_byte, storeb_RRCC)
+{
+	int o;
+	int v;
+	int r1;
+	int r2;
+
+	r1 = rreg_int(0);
+	r2 = rreg_int(1);
+	o = const_int(2);
+	v = const_int(3);
+
+	OUT(0xC6);
+	OUT(0x84);
+	OUT((r2<<3)|r1);
+	LOUT(o);
+	OUT(v);
+
+        debug(("movb $%d,%d(%s,%s)\n", v, o, regname(r1), regname(r2)));
+}
+
+define_insn(fake_call, fakecall_xCC)
+{
+	label* tol = const_label(2);
+	label* froml = const_label(1);
+
+	OUT(0x68);
+	froml->type |= Llong|Labsolute;
+	froml->at = CODEPC;
+	LOUT(0);
+	froml->from = 0;
+
+	debug(("pushl <return_addr>\n"));
+
+	OUT(0xE9);
+	tol->type |= Llong|Lrelative;
+	tol->at = CODEPC;
+	LOUT(0);
+	tol->from = CODEPC;
+	debug(("jmpl ?\n"));
+}
+
+define_insn(cmp_int_offset, cmp_xRRC)
+{
+        int r1 = rreg_int(1);
+        int r2 = rreg_int(2);
+        int off = const_int(3);
+
+        OUT(0x3B);
+        OUT(0x80|(r1<<3)|r2);
+	LOUT(off);
+
+        debug(("cmpl %d(%s),%s\n", off, regname(r2), regname(r1)));
+}
+
+/* --------------------------------------------------------------------- */
+
+void
+kill_readonce_register (SlotData *s)
+{
+DBG(REGFORCE,
+    dprintf ("kill_readonce_register(%s)\n", regname(s->regno));
+    );
+	if (((reginfo[s->regno].ctype & Rdouble) && (s->regno == REG_dbl0)) ||
+	    ((reginfo[s->regno].ctype & Rfloat) && (s->regno == REG_flt0))) {
+	    	OUT(0xDD);
+		OUT(0xD8);
+
+		debug (("fstp %%st(0)\n"));
+	}
+
+}
+
+/* --------------------------------------------------------------------- */
+/* --------------------------------------------------------------------- */
+/* --------------------------------------------------------------------- */
+
+static const char *debugBuffer (const char *format, ...)
+{
+   	va_list marker;
+   	va_start (marker, format);
+
+	static char buffer[8][1024];
+	static int bufIndex = 0;
+	bufIndex = (bufIndex + 1) % 8;
+
+	vsprintf (buffer[bufIndex], format, marker);
+	va_end (marker);
+	return buffer[bufIndex];
+}
+
+static const char *debugRegister (Register reg)
+{
+	if (reg == NOREGISTER) return "";
+	return rnames[reg];
+}
+
+static const char *debugTaintRegister (const TaintRegister *taintReg)
+{
+	return debugBuffer ("xmm%u[%u]", taintReg->xmmReg, taintReg->part);
+}
+
+static const char *debugRegMem (const RegMem *rm)
+{
+	if (regMemIsTaint (rm))
+	{
+		return debugTaintRegister (rm->taint);
+	}
+	else if (regMemIsConstant (rm))
+	{
+		return debugBuffer ("$0x%X", rm->disp);
+	}
+	else if (regMemIsIndirect (rm))
+	{
+		if (regMemHasSIB (rm))
+		{
+			return debugBuffer ("%d(%s+%s*%d)", rm->disp,
+								rnames[rm->reg], rnames[rm->index], rm->scale);
+		}
+		else if (regMemIsFixed (rm))
+		{
+			return debugBuffer ("*%p", (void *) rm->disp);
+		}
+		else
+		{
+			return debugBuffer ("%d(%s)", rm->disp, rnames[rm->reg]);
+		}
+	}
+	else
+	{
+		return debugRegister (rm->reg);
+	}
+}
+
+static void genSIB (const RegMem *dst)
+{
+	assert (dst->index != REG_ebp); // EBP is only used as base for stack locations
+
+	uint8 sib = dst->reg | (dst->index << 3);
+	switch (dst->scale)
+	{
+	case 1: break;
+	case 2: sib |= 0x40; break;
+	case 4: sib |= 0x80; break;
+	case 8: sib |= 0xC0; break;
+	default: abort ();
+	}
+	OUT (sib);
+}
+
+static void genRM (uint regSrc, const RegMem *dst, bool espWantSIB)
+{
+	//assert (!dst || !regMemIsConstant (dst));
+	if (!dst || regMemIsFixed (dst))
+	{
+		OUT (0x05 | (regSrc << 3));
+	}
+	else
+	{
+		uint8 rm;
+		if (dst && regMemIsIndirect (dst))
+			rm = 0x80;
+		else if (!regMemIsConstant (dst))
+			rm = 0xC0;
+		rm |= (regSrc << 3);
+
+		if (regMemIsConstant (dst))
+			rm |= 5;
+		else if (regMemHasSIB (dst))
+			rm |= 4;
+		else if (dst)
+			rm |= dst->reg;
+
+		OUT (rm);
+
+		if (regMemHasSIB (dst))
+			genSIB (dst);
+		else if (espWantSIB && dst->reg == REG_esp)
+			OUT (0x24);
+	}
+
+	if (dst && (regMemIsIndirect (dst) || regMemIsConstant (dst)))
+		LOUT (dst->disp);
+}
+
+static void genRM8 (uint regSrc, const RegMem *dst, bool espWantSIB)
+{
+	//assert (!dst || !regMemIsConstant (dst));
+	if (!dst || regMemIsFixed (dst))
+	{
+		OUT (0x05 | (regSrc << 3));
+	}
+	else
+	{
+		uint8 rm;
+		if (dst && regMemIsIndirect (dst))
+			rm = 0x40;
+		else
+			rm = 0xC0;
+		rm |= (regSrc << 3);
+
+		if (regMemHasSIB (dst))
+			rm |= 4;
+		else if (dst)
+			rm |= dst->reg;
+
+		OUT (rm);
+
+		if (regMemHasSIB (dst))
+			genSIB (dst);
+		else if (espWantSIB && dst->reg == REG_esp)
+			OUT (0x24);
+	}
+
+	if (dst && regMemIsIndirect (dst))
+		OUT ((uint8) dst->disp);
+}
+
+static void genPush (const RegMem *src)
+{
+	if (regMemIsConstant (src))
+	{
+		OUT (0x68);
+		LOUT (src->disp);
+	}
+	else if (regMemIsIndirect (src))
+	{
+		OUT (0xFF);
+		genRM (6, src, false);
+	}
+	else
+	{
+		OUT (0x50 | src->reg);
+	}
+	debug (("TAINT: push %s\n", debugRegMem (src)));
+}
+
+static void genPop (const RegMem *dst)
+{
+	assert (!regMemIsConstant (dst));
+	if (regMemIsIndirect (dst))
+	{
+		OUT (0x8F);
+		genRM (0, dst, false);
+	}
+	else
+	{
+		OUT (0x58 | dst->reg);
+	}
+	debug (("TAINT: pop %s\n", debugRegMem (dst)));
+}
+
+// Like genPush, but checks allowedTemporary
+static void genPushTemp (const RegMem *src)
+{
+	assert (!regMemIsIndirect (src));
+	if (src->reg != allowedTemporary)
+		genPush (src);
+}
+
+// Like genPop, but checks allowedTemporary
+static void genPopTemp (const RegMem *src)
+{
+	assert (!regMemIsIndirect (src));
+	if (src->reg != allowedTemporary)
+		genPop (src);
+}
+
+typedef struct
+{
+	const char 	*name;
+	uint8		r2rm;
+	uint8		rm2r;
+	uint8		c2r;
+	uint8		c2rm;
+	uint8		c2rm_add;
+} Operation;
+
+static const Operation OPER_MOV	=	{"movl",	0x89,	0x8B,	0xB8,	0xC7,	0x00};
+static const Operation OPER_OR	=	{"orl",		0x09,	0x0B,	0x00,	0x81,	0x01};
+static const Operation OPER_SUB	=	{"subl",	0x29,	0x2B,	0x00,	0x81,	0x05};
+static const Operation OPER_ADD	=	{"addl",	0x01,	0x03,	0x00,	0x81,	0x00};
+
+static void genOper (const Operation *oper, const RegMem *src, const RegMem *dst)
+{
+	debug (("TAINT: %s %s, %s\n", oper->name, debugRegMem (src), debugRegMem (dst)));
+	assert (!regMemIsConstant (dst));
+
+	if (regMemIsConstant (src))
+	{
+		if (regMemIsIndirect (dst) || !oper->c2r)
+		{
+			OUT (oper->c2rm);
+			genRM (oper->c2rm_add, dst, false);
+			LOUT (src->disp);
+		}
+		else
+		{
+			OUT (oper->c2r + dst->reg);
+			LOUT (src->disp);
+		}
+	}
+	else if (!regMemIsIndirect (src))
+	{
+		OUT (oper->r2rm);
+		genRM (src->reg, dst, false);
+	}
+	else if (!regMemIsIndirect (dst))
+	{
+		OUT (oper->rm2r);
+		genRM (dst->reg, src, false);
+	}
+	else
+	{
+		// Mem to mem
+
+		// Push tmp, src -> tmp, tmp -> dst, pop tmp
+		RegMem rmTemp  = getTemporaryRM2 (src, dst);
+
+		genPush (&rmTemp);
+		genMov	(src, &rmTemp);
+		genOper (oper, &rmTemp, dst);
+		genPop  (&rmTemp);
+	}
+}
+
+static void genMov (const RegMem *src, const RegMem *dst) 	{genOper (&OPER_MOV, src, dst);}
+static void genOr  (const RegMem *src, const RegMem *dst) 	{genOper (&OPER_OR,  src, dst);}
+static void genSub (const RegMem *src, const RegMem *dst) 	{genOper (&OPER_SUB, src, dst);}
+static void genAdd (const RegMem *src, const RegMem *dst) 	{genOper (&OPER_ADD, src, dst);}
+
+static void genAddConst (uint value, const RegMem *dst)
+{
+	RegMem rmConst = GetConstantRM (value);
+	genAdd (&rmConst, dst);
+}
+
+static void genSubConst (uint value, const RegMem *dst)
+{
+	RegMem rmConst = GetConstantRM (value);
+	genSub (&rmConst, dst);
+}
+
+static void genXMM2RM (uint xmmSrc, const RegMem *rmDst)
+{
+	OUT (0x66); OUT (0x0F); OUT (0x7E);
+	genRM (xmmSrc, rmDst, true);
+	debug (("TAINT: movd xmm%u, %s\n", xmmSrc, debugRegMem (rmDst)));
+}
+
+static void genRM2XMM_ZEROED (const RegMem *rmSrc, uint xmmDst)
+{
+	OUT (0x66); OUT (0x0F); OUT (0x6E);
+	genRM (xmmDst, rmSrc, true);
+	debug (("TAINT: movd %s, xmm%u\n", debugRegMem (rmSrc), xmmDst));
+}
+
+static void genXMMPshufd (uint xmmSrc, uint xmmDst, uint8 order)
+{
+	OUT (0x66); OUT (0x0F); OUT (0x70); OUT (0xC0 | (xmmDst << 3) | xmmSrc); OUT (order);
+	debug (("TAINT: pshufd $%u, %%xmm%u, %%xmm%u\n", order, xmmSrc, xmmDst));
+}
+
+static void genXMMPor (uint xmmSrc, uint xmmDst)
+{
+	OUT (0x66); OUT (0x0F); OUT (0xEB); OUT (0xC0 | (xmmDst << 3) | xmmSrc);
+	debug (("TAINT: por %%xmm%u, %%xmm%u\n", xmmSrc, xmmDst));
+}
+
+taint_t nativeRetValGetTaint (char retType)
+{
+	taint_t taint;
+
+	switch (retType)
+	{
+	case 'F':
+	case 'D':
+		asm ("movd %%xmm3, %0" : : "m" (taint));
+		break;
+	default:
+		asm ("movd %%xmm0, %0" : : "m" (taint));
+		break;
+	}
+
+	return taint;
+}
+
+void nativeRetValSetTaint (char sig, taint_t taint)
+{
+	// Load into scratch
+	asm ("movd %0, %"XMM_SCRATCH_ASM : : "m" (taint));
+	switch (sig)
+	{
+	case 'F':
+		asm ("pshufd  $231, %xmm3, %xmm3");
+		asm ("por "XMM_SCRATCH_ASM", %xmm3");
+		break;
+	case 'D':
+		asm ("pshufd  $231, %xmm3, %xmm3");
+		asm ("por "XMM_SCRATCH_ASM", %xmm3");
+		break;
+	default:
+		// Clear target
+		asm ("pshufd  $231, %xmm0, %xmm0");
+
+		// Or into position
+		asm ("por "XMM_SCRATCH_ASM", %xmm0");
+		break;
+	}
+}
+
+void nativeRetValSubTaint (UNUSED char sig, UNUSED taint_t taint)
+{
+	abort ();
+}
+
+taint_t nativeContextGetTaint ()
+{
+	taint_t taint;
+	asm ("movd %%xmm2, %0" : : "m" (taint));
+	return taint;
+}
+
+taint_t nativeParamGetTaint (uint ndx)
+{
+	return taintMerge2 (argumentStackMarker[ndx], nativeContextGetTaint ());
+}
+
+static void genTaintXMM2Working (const TaintRegister *taintSrc, const RegMem *rmDst, Register displayRegister)
+{
+	debug (("TAINT: genTaintXMM2Working %s: %s -> %s\n",
+			debugRegister (displayRegister),
+			debugTaintRegister (taintSrc),
+			debugRegMem (rmDst)));
+
+	if (taintSrc->part == 0)
+	{
+		// If part = 0, can save directly as only lowest 32 bits are stored
+		genXMM2RM (taintSrc->xmmReg, rmDst);
+	}
+	else
+	{
+		// Otherwise, first shuffle into XMM_MEM_SCRATCH, then copy to correct xmm
+		genXMMPshufd (taintSrc->xmmReg, XMM_SCRATCH, taintSrc->part);
+		genXMM2RM (XMM_SCRATCH, rmDst);
+	}
+}
+
+static void genTaintWorking2XMM (const RegMem *rmSrc, const TaintRegister *taintDst, Register displayRegister)
+{
+	debug (("TAINT: genTaintWorking2XMM %s: %s -> %s\n",
+			debugRegister (displayRegister),
+			debugRegMem (rmSrc),
+			debugTaintRegister (taintDst)));
+
+	// First shuffle register into lowest word by exchanging with lowest word
+	switch (taintDst->part)
+	{
+	case 0: genXMMPshufd (taintDst->xmmReg, taintDst->xmmReg, 0xE7); break; // Zero lowest part
+	case 1: genXMMPshufd (taintDst->xmmReg, taintDst->xmmReg, 0xE3); break; // #1 <- #0, #0 <- zeroed
+	case 2: genXMMPshufd (taintDst->xmmReg, taintDst->xmmReg, 0xC7); break; // #1 <- #0, #0 <- zeroed
+	default: abort ();							 						    // part 3 is not used
+	}
+
+	// Store into lowest part
+	genRM2XMM_ZEROED (rmSrc, XMM_SCRATCH);
+	genXMMPor (XMM_SCRATCH, taintDst->xmmReg);
+
+	// Reshuffle into correct position
+	switch (taintDst->part)
+	{
+	case 0: break; // If part = 0, can save directly as only lowest 32 bits are stored
+	case 1: genXMMPshufd (taintDst->xmmReg, taintDst->xmmReg, 0xE1); break; // Exchange 0 <> 1
+	case 2: genXMMPshufd (taintDst->xmmReg, taintDst->xmmReg, 0xC6); break; // Exchange 0 <> 2
+	default: abort ();							  					  	    // part 3 is not used
+	}
+}
+
+static void genTaintXMM2RM (const TaintRegister *xmm, const RegMem *rmDst)
+{
+	genTaintXMM2Working (xmm, rmDst, NOREGISTER);
+}
+
+/**
+ * Loads the register's taint into the stack
+ */
+static void genTaintXMM2Stack (const TaintRegister *xmm)
+{
+	genSubConst (4, &REGISTER_RM[REG_esp]);
+
+	RegMem rmDst = GetStackRM (0);
+	genTaintXMM2RM (xmm, &rmDst);
+}
+
+static void genTaintTaintRegPush (const TaintRegister *xmm)
+{
+	genTaintXMM2Stack (xmm);
+}
+
+static void genTaintTaintRegPop (const TaintRegister *xmm)
+{
+	RegMem rmSrc = GetStackRM (0);
+	genTaintWorking2XMM (&rmSrc, xmm, NOREGISTER);
+
+	genAddConst (4, &REGISTER_RM[REG_esp]);
+}
+
+/**
+ * Pushes the register's taint onto the stack
+ */
+static void genTaintRegPush (Register reg)
+{
+	genSubConst (4, &REGISTER_RM[REG_esp]);
+
+	RegMem rmDst = GetStackRM (0);
+	genTaintXMM2Working (&TAINT_REGS[reg], &rmDst, reg);
+}
+
+/**
+ * Pops the register's taint from the stack
+ */
+static void genTaintRegPop (Register reg)
+{
+	RegMem rmSrc = GetStackRM (0);
+	genTaintWorking2XMM (&rmSrc, &TAINT_REGS[reg], reg);
+
+	genAddConst (4, &REGISTER_RM[REG_esp]);
+}
+
+static void genXMMClearPart (const TaintRegister *xmm)
+{
+	uint8 order = 0xE4; // E4 = identity shuffle
+	order |= (0x03 << (xmm->part * 2));
+	genXMMPshufd (xmm->xmmReg, xmm->xmmReg, order);
+}
+
+static bool regMemUsesRegister (const RegMem *rm, Register reg)
+{
+	if (regMemIsConstant (rm))
+		return false;
+
+	if (rm->reg == reg)
+		return true;
+
+	if (regMemHasSIB (rm) && rm->index == reg)
+		return true;
+
+	return false;
+}
+
+static RegMem getTemporaryRM2 (const RegMem *inUse1, const RegMem *inUse2)
+{
+	uint i;
+
+	// This will always work, as an RM contains at most 2 registers.
+	for (i = REG_eax; i < REG_ebp; i++)
+	{
+		if ((!inUse1 || !regMemUsesRegister (inUse1, (Register) i)) &&
+			(!inUse2 || !regMemUsesRegister (inUse2, (Register) i)))
+		{
+			return GetRegisterRM ((Register) i);
+			break;
+		}
+	}
+
+	abort ();
+	return *(RegMem *) NULL;
+}
+
+static RegMem getTemporaryRM (const RegMem *inUse)
+{
+	return getTemporaryRM2 (inUse, NULL);
+}
+
+static void genTaintShared (const RegMem *src, const RegMem *dst, bool zero)
+{
+	if (regMemIsIndirect (src) && regMemIsIndirect (dst))
+	{
+		// Memory to memory combine
+
+		// Load src into eax, and or this into dst. Eax is saved in XMM_SCRATCH
+
+		// TODO: eax might be in use
+		// Save eax
+		genRM2XMM_ZEROED (&GetRegisterRM (REG_eax), XMM_SCRATCH);
+
+		// Load src into eax
+		OUT (0x8B);
+		OUT (0x80 | src->reg);
+		LOUT (src->disp);
+		debug (("TAINT: movl %s, %%eax\n", debugRegMem (src)));
+
+		// Or/mov eax, dst
+		OUT (zero ? 0x89 : 0x09 /* ? mov : or */);
+		genRM (REG_eax, dst, false);
+		debug (("TAINT: %s %%eax, %s\n", zero ? "mov" : "or", debugRegMem (dst)));
+
+		 // Restore eax
+		genXMM2RM (XMM_SCRATCH, &GetRegisterRM (REG_eax));
+	}
+	else
+	{
+		const TaintRegister *srcTaint;
+		const TaintRegister *dstTaint;
+		if (!regMemIsIndirect (src) && !regMemIsIndirect (dst))
+		{
+			// Reg/Reg combine
+			srcTaint = regMemIsTaint (src) ? src->taint : &TAINT_REGS[src->reg];
+			dstTaint = regMemIsTaint (dst) ? dst->taint : &TAINT_REGS[dst->reg];
+		}
+		else if (!regMemIsIndirect (src))
+		{
+			// Combine source register into memory location
+			srcTaint = regMemIsTaint (src) ? src->taint : &TAINT_REGS[src->reg];
+			dstTaint = &XMM_SCRATCH_PART0;
+		}
+		else if (!regMemIsIndirect (dst))
+		{
+			// Combine source memory location into destination register
+
+			// Load memory into scratch register
+			genRM2XMM_ZEROED (src, XMM_SCRATCH);
+			srcTaint = &XMM_SCRATCH_PART0;
+			dstTaint = regMemIsTaint (dst) ? dst->taint : &TAINT_REGS[dst->reg];
+		}
+
+		// Move source to correct part in scratch
+		uint8 order = 0xFF;
+		uint8 mask  = ~(0x03 << (dstTaint->part * 2));
+		order = (order & mask) | (srcTaint->part << (dstTaint->part * 2));
+		genXMMPshufd 	(srcTaint->xmmReg, XMM_SCRATCH, order);
+
+		if (!regMemIsIndirect (src) && regMemIsIndirect (dst))
+		{
+			if (zero)
+			{
+				// Save scratch register to memory location
+				genXMM2RM (XMM_SCRATCH, dst);
+			}
+			else
+			{
+				RegMem rmTmp = getTemporaryRM (dst);
+
+				// Must or into place, us temporary
+				genPushTemp	(&rmTmp);
+				genXMM2RM 	(XMM_SCRATCH, &rmTmp);
+				genOr		(&rmTmp, dst);
+				genPopTemp	(&rmTmp);
+			}
+		}
+		else
+		{
+			if (zero)
+			{
+				// Clear destination
+				genXMMClearPart (dstTaint);
+			}
+
+			// Include scratch (which contains source) in destination
+			genXMMPor		(XMM_SCRATCH, dstTaint->xmmReg);
+		}
+	}
+}
+
+static void genTaintCombine (RegMem src, RegMem dst)
+{
+	TRAP (COMBINE);
+	debug (("TAINT COMBINE: %s ->| %s\n", debugRegMem (&src), debugRegMem (&dst)));
+	genTaintShared (&src, &dst, false);
+}
+
+static void genTaintCombine3 (RegMem src1, RegMem src2, RegMem dst)
+{
+	TRAP (COMBINE);
+	debug (("TAINT COMBINE3: %s | %s ->| %s\n", debugRegMem (&src1), debugRegMem (&src2), debugRegMem (&dst)));
+	genTaintShared (&src1, &dst, false);
+	genTaintShared (&src2, &dst, false);
+}
+
+static void genTaintStore (const RegMem *tainted, taint_t *store)
+{
+	RegMem dst = GetFixedRM (store);
+	debug (("TAINT STORE: %s -> %s\n", debugRegMem (tainted), debugRegMem (&dst)));
+	genTaintShared (tainted, &dst, true);
+}
+
+static void genTaintLoad (taint_t *store, const RegMem *tainted)
+{
+	RegMem src = GetFixedRM (store);
+	debug (("TAINT LOAD: %s -> %s\n", debugRegMem (&src), debugRegMem (tainted)));
+	genTaintShared (&src, tainted, true);
+}
+
+static void genTaintPropagate (RegMem src, RegMem dst)
+{
+	TRAP (PROPAGATE);
+	debug (("TAINT PROPAGATE: %s -> %s\n", debugRegMem (&src), debugRegMem (&dst)));
+	genTaintShared (&src, &dst, true);
+}
+
+static void genTaintPropagate3 (RegMem src1, RegMem src2, RegMem dst)
+{
+	TRAP (PROPAGATE);
+	debug (("TAINT PROPAGATE: %s | %s -> %s\n", debugRegMem (&src1), debugRegMem (&src2), debugRegMem (&dst)));
+	genTaintShared (&src1, &dst, true);
+	genTaintShared (&src2, &dst, false);
+}
+
+static void genTaintRegSpill (Register reg, int offset)
+{
+	// Spill the register's taint into EBP(offset)
+	RegMem rmStore = GetLocalRM (offset);
+	genTaintXMM2Working (&TAINT_REGS[reg], &rmStore, reg);
+}
+
+static void genTaintRegReload (Register reg, int offset)
+{
+	// Reload the register's taint from EBP(offset)
+	RegMem rmStore = GetLocalRM (offset);
+	genTaintWorking2XMM (&rmStore, &TAINT_REGS[reg], reg);
+}
+
+static void genClearTaint (Register reg)
+{
+	genXMMClearPart (&TAINT_REGS[reg]);
+}
+
+/**
+ * Generates a RegMem from the specified slot.
+ * If no slot is specified, the next slot is expected to contain a constant value, which is returned.
+ */
+static RegMem GetSlotRegMem (sequence *s, int idx, bool isDouble)
+{
+	if (const_int (idx) == 0)
+	{
+		return GetConstantRM (const_int (idx + 1));
+	}
+	else if (inRegister(idx, 0xFF))
+	{
+		return GetRegisterRM (seq_slot(s, idx)->regno);
+	}
+	else
+	{
+		return GetLocalRM (isDouble ? slotOffsetNoSpillTaint(seq_slot (s, idx), Rdouble) : slot_taint (idx));
+	}
+}
+
+define_insn (do_taint_object_load, do_taint_object_load)
+{
+	static RegMem rmObject;
+	if (const_int (3) /* before */)
+	{
+		// Store this register
+		rmObject = GetSlotRegMem (s, 0, false);
+	}
+	else
+	{
+		RegMem rmDst 		 = GetSlotRegMem (s, 0, false);
+		int fieldIndex 		 = const_int (2);
+		RegMem rmMemberTaint = GetRegMem 	(rmObject.reg, OFFSET_MEMBER_TAINT, FLAG_IS_INDIRECT);
+		RegMem rmTaint;
+
+		// Push this pointer
+		genPush (&rmObject);
+
+		// Adjust this pointer to taint memory
+		genMov (&rmMemberTaint, &rmObject);
+
+	 	rmTaint = GetRegMem (rmObject.reg, sizeof (taint_t) * fieldIndex, FLAG_IS_INDIRECT);
+
+		// Include reference taint
+		genTaintPropagate (rmObject, rmDst);
+
+		// Include value taint
+		genTaintCombine (rmTaint, rmDst);
+
+#ifdef TRISHUL_TAINT_MEMBER_ON_OBJECT_LOAD
+// TODO
+	#error Not implemented
+#endif
+
+		// Pop this pointer
+		genPop (&rmObject);
+	}
+}
+
+static void taint_object_store_impl (const RegMem *rmObj, int fieldIndex, const RegMem *rmSrc)
+{
+	RegMem rmMemberTaint = GetRegMem (rmObj->reg, OFFSET_MEMBER_TAINT, FLAG_IS_INDIRECT);
+	RegMem rmTaint		 = GetRegMem (rmObj->reg, fieldIndex * sizeof (taint_t), FLAG_IS_INDIRECT);
+
+#ifdef TRISHUL_TAINT_OBJECT_ON_MEMBER_STORE
+	// Reserve a temporary, to OR the array taint into
+	RegMem rmTemp = getTemporaryRM (rmObj);
+	genPush (&rmTemp);
+	allowedTemporary = rmTemp.reg;
+#endif
+
+	// Push this pointer
+	genPush (rmObj);
+
+	// Adjust this pointer to taint memory
+	genMov (&rmMemberTaint, rmObj);
+
+	if (rmSrc)
+	{
+		// Include reference taint
+		genTaintPropagate (*rmObj, rmTaint);
+
+		// Include value taint
+		genTaintCombine (*rmSrc, rmTaint);
+	}
+
+	// Include context taint
+	genTaintCombine (RM_TAINT_CONTEXT, rmTaint);
+
+#ifdef TRISHUL_TAINT_OBJECT_ON_MEMBER_STORE
+	allowedTemporary = NOREGISTER;
+
+	// Store element taint in temporary
+	genMov (&rmTaint, &rmTemp);
+#endif
+
+	// Pop this pointer
+	genPop (rmObj);
+
+#ifdef TRISHUL_TAINT_OBJECT_ON_MEMBER_STORE
+	// Include taint stored in scratch into object taint
+	RegMem rmObject = *rmObj;
+	rmObject.flags |= FLAG_IS_INDIRECT;
+	rmObject.disp  += OFFSET_OBJECT_TAINT;
+	genOr (&rmTemp, &rmObject);
+
+	genPop (&rmTemp);
+#endif
+}
+
+define_insn (do_taint_object_store, do_taint_object_store)
+{
+	RegMem rmObj 		 = GetSlotRegMem (s, 0, false);
+	int fieldIndex 		 = const_int (2);
+	RegMem rmSrc	  	 = (const_int(3) == 'D' || const_int(3) == 'F') ? GetRegisterRM (REG_flt0) :
+																		  GetSlotRegMem (s, 1, false);
+	taint_object_store_impl (&rmObj, fieldIndex, &rmSrc);
+}
+
+define_insn (do_taint_array_load, do_taint_array_load)
+{
+	static RegMem rmArray;
+	static RegMem rmIndex;
+
+	if (const_int (3) /* before */)
+	{
+		rmArray = GetSlotRegMem (s, 0, false);
+		rmIndex = GetSlotRegMem (s, 1, false);
+	}
+	else
+	{
+		rmArray 			 = GetSlotRegMem (s, 1, false);
+		RegMem rmDst 		 = GetSlotRegMem (s, 0, false);
+		RegMem rmMemberTaint = GetRegMem 	(rmArray.reg, OFFSET_MEMBER_TAINT, FLAG_IS_INDIRECT);
+		RegMem rmTaint;
+
+		// Push this pointer
+		genPush (&rmArray);
+
+		// Adjust this pointer to taint memory
+		genMov (&rmMemberTaint, &rmArray);
+
+		if (regMemIsConstant (&rmIndex))
+		{
+		 	rmTaint = GetRegMem (rmArray.reg, sizeof (taint_t) * rmIndex.disp, FLAG_IS_INDIRECT);
+
+			// Include reference taint
+			genTaintPropagate (rmArray, rmDst);
+		}
+		else
+		{
+		 	rmTaint = GetRegMemSIB (sizeof (taint_t), rmIndex.reg, rmArray.reg);
+
+			// Include index & reference taint
+			genTaintPropagate3 (rmArray, rmIndex, rmDst);
+		}
+
+		// Include value taint
+		genTaintCombine (rmTaint, rmDst);
+
+#ifdef TRISHUL_TAINT_MEMBER_ON_ARRAY_LOAD
+// TODO
+	#error Not implemented
+#endif
+
+		// Pop this pointer
+		genPop (&rmArray);
+	}
+}
+
+define_insn (do_taint_array_store, do_taint_array_store)
+{
+	RegMem rmArrayIn  = GetSlotRegMem (s, 0, false);
+	RegMem rmIndex    = GetSlotRegMem (s, 2, false);
+	RegMem rmSource   = (const_int(4) == 'D' || const_int(4) == 'F') ? GetRegisterRM (REG_flt0) :
+																	 GetSlotRegMem (s, 1, false);
+
+	RegMem rmArray;
+	bool needPopArray;
+	if (regMemIsIndirect (&rmArrayIn))
+	{
+		// If the array pointer is not in a reg, load it into a temporary
+		rmArray = getTemporaryRM2 (&rmIndex, &rmSource);
+		genPush (&rmArray);
+		needPopArray = true;
+	}
+	else
+	{
+		rmArray = rmArrayIn;
+		needPopArray = false;
+	}
+
+	RegMem rmMemberTaint = GetRegMem 	(rmArray.reg, OFFSET_MEMBER_TAINT, FLAG_IS_INDIRECT);
+	RegMem rmTaint 		 = GetRegMemSIB (sizeof (taint_t), rmIndex.reg, rmArray.reg);
+
+#ifdef TRISHUL_TAINT_ARRAY_ON_MEMBER_STORE
+	// Reserve a temporary, to OR the array taint into
+	RegMem rmTemp = getTemporaryRM (&rmTaint);
+	genPush (&rmTemp);
+	allowedTemporary = rmTemp.reg;
+#endif
+
+	// Push this pointer
+	genPush (&rmArray);
+
+	// Adjust this pointer to taint memory
+	genMov (&rmMemberTaint, &rmArray);
+
+	if (regMemIsConstant (&rmIndex))
+	{
+	 	rmTaint = GetRegMem (rmArray.reg, sizeof (taint_t) * rmIndex.disp, FLAG_IS_INDIRECT);
+
+		// Include reference taint
+		genTaintPropagate (rmArray, rmTaint);
+	}
+	else
+	{
+	 	rmTaint = GetRegMemSIB (sizeof (taint_t), rmIndex.reg, rmArray.reg);
+
+		// Include index & reference taint
+		genTaintPropagate3 (rmArray, rmIndex, rmTaint);
+	}
+
+	// Include value taint
+	genTaintCombine (rmSource, rmTaint);
+
+#ifdef TRISHUL_TAINT_ARRAY_ON_MEMBER_STORE
+	allowedTemporary = NOREGISTER;
+
+	// Store element taint in temporary
+	genMov (&rmTaint, &rmTemp);
+#endif
+
+	// Pop this pointer
+	genPop (&rmArray);
+
+#ifdef TRISHUL_TAINT_ARRAY_ON_MEMBER_STORE
+	// Include taint stored in scratch into array taint
+	RegMem rmObject = rmArray;
+	rmObject.flags |= FLAG_IS_INDIRECT;
+	rmObject.disp  += OFFSET_OBJECT_TAINT;
+	genOr (&rmTemp, &rmObject);
+
+	genPop (&rmTemp);
+#endif
+
+	if (needPopArray)
+		genPop (&rmArray);
+}
+
+define_insn (do_taint_static_store, do_taint_static_store)
+{
+	Field 	*field		= (Field *) const_int (2);
+	RegMem 	rmSrc 		= GetSlotRegMem (s, 0, field->signature->data[0] == 'D');
+	taint_t *taintAddr 	= &field->trishul.taint;
+	genTaintStore (&rmSrc, taintAddr);
+}
+
+define_insn (do_taint_static_load, do_taint_static_load)
+{
+	Field 	*field		= (Field *) const_int (2);
+	RegMem 	rmDst 		= GetSlotRegMem (s, 0, field->signature->data[0] == 'D');
+	taint_t *taintAddr 	= &field->trishul.taint;
+	genTaintLoad (taintAddr, &rmDst);
+}
+
+define_insn(do_rebuild_context_taint, do_rebuild_context_taint)
+{
+	// push eax
+	OUT (0x50);
+	debug (("TAINT CONTEXT REBUILD +++++\n")); // After first OUT, so label is output before debug message
+	debug (("TAINT: push eax\n"));
+
+
+	RegMem rmTmp 		= GetRegisterRM (REG_eax);
+	RegMem rmPart 		= GetRegMem (REG_ebp, -4, FLAG_IS_INDIRECT);
+#ifdef TRISHUL_FALLBACK
+	RegMem rmFallback	= GetFixedRM (&fallbackTaint);
+#endif
+
+	// Include the initial context taint
+	genMov (&rmPart, &rmTmp);
+
+#ifdef TRISHUL_FALLBACK
+	// And the fallback context taint
+	genOr (&rmFallback, &rmTmp);
+#endif
+
+	// Include the parts indicated by the bitmap
+	uint 						i;
+	RuntimeBitmapElement 		mask = 0;
+	const RuntimeBitmapElement	*ptr_src = currentContext->bitmap - 1; /* Will be incremented in first iteration */
+	for (i = 0; i < globalMethod->bitmap_size_bits; i++, mask <<= 1)
+	{
+		if ((i % (8 * sizeof (RuntimeBitmapElement))) == 0)
+		{
+			mask = 1;
+			ptr_src++;
+		}
+
+		if ((*ptr_src) & mask)
+		{
+			rmPart.disp = -8 - i * sizeof (taint_t);
+			genOr (&rmPart, &rmTmp);
+		}
+	}
+
+	// Store into context register
+	RegMem rm = GetRegisterRM (REG_eax);
+	genTaintWorking2XMM (&rm, &TAINT_CONTEXT, NOREGISTER);
+
+// DEBUG: Break if ctx != 0
+//	OUT (0x81); OUT (0xfb); LOUT(0); OUT (0x74); OUT (0x01); OUT (0xcc);
+
+	debug (("TAINT: pop eax\n"));
+	OUT (0x58);
+	debug (("TAINT CONTEXT REBUILD ----\n"));
+
+}
+
+define_insn(do_store_method_annotation, do_store_method_annotation)
+{
+	RegMem rmVar = GetFixedRM (&trishulAnnotatedOriginalStack);
+	if (const_int (2)) /* before call */
+	{
+		genPush (&rmVar);
+		RegMem rmNewMethod = GetConstantRM (const_int (1));
+		genMov (&rmNewMethod, &rmVar);
+	}
+	else
+	{
+		genPop (&rmVar);
+	}
+}
+
+static void genCmp8 (const RegMem *lhs, const RegMem *rhs)
+{
+	debug (("TAINT: cmpb %s, %s\n", debugRegMem (lhs), debugRegMem (rhs)));
+
+	if (regMemIsIndirect (lhs))
+	{
+		assert (!regMemIsIndirect (rhs));
+
+		if (regMemIsConstant (rhs))
+		{
+			OUT (0x80);
+			genRM8 (7, lhs, true);
+			OUT (rhs->disp);
+		}
+		else
+		{
+			OUT (0x38);
+			genRM8 (rhs->reg, lhs, true);
+		}
+	}
+	else
+	{
+		OUT (0x38);
+		genRM8 (lhs->reg, rhs, true);
+	}
+}
+static void genCmp (const RegMem *lhs, const RegMem *rhs)
+{
+	debug (("TAINT: cmpl %s, %s\n", debugRegMem (lhs), debugRegMem (rhs)));
+
+	if (regMemIsIndirect (lhs) || regMemIsConstant (rhs))
+	{
+		assert (!regMemIsIndirect (rhs));
+
+		if (regMemIsConstant (rhs))
+		{
+			OUT (0x81);
+			genRM (7, lhs, true);
+			LOUT (rhs->disp);
+		}
+		else
+		{
+			OUT (0x39);
+			genRM (rhs->reg, lhs, true);
+		}
+	}
+	else
+	{
+		OUT (0x39);
+		genRM (lhs->reg, rhs, true);
+	}
+}
+
+static void genCall (const char *msg, void *meth)
+{
+	debug (("TAINT: call %s\n", msg));
+	OUT (0xE8);
+	label *l = KaffeJIT3_newLabel ();
+	l->type = Lexternal | Llong | Lrelative;
+	l->at = CODEPC;
+	l->to = (uintp) meth;
+	LOUT(0);
+	l->from = CODEPC;
+}
+
+static void genPushAll ()
+{
+	// TODO: more selective push/pop
+	debug (("TAINT: pusha\n"));
+	OUT (0x60);
+}
+
+static void genPopAll ()
+{
+	// TODO: more selective push/pop
+	debug (("TAINT: popa\n"));
+	OUT (0x61);
+}
+
+static JumpLabel genJump ()
+{
+	OUT (0xEB);
+	uint fixAddress = CODEPC;
+	debug (("TAINT: jump -> %X\n", fixAddress));
+	OUT (0x00);
+	return (JumpLabel) fixAddress;
+}
+
+static JumpLabel genJumpCond (const JumpType *type)
+{
+	OUT (0x70 | type->opcode);
+	uint fixAddress = CODEPC;
+	debug (("TAINT: jump%s -> %X\n", type->name, fixAddress));
+	OUT (0x00);
+	return (JumpLabel) fixAddress;
+}
+
+static void setJumpTarget (JumpLabel l)
+{
+	uint fixAddress = (uint) l;
+	*(uint8*)&codeblock[fixAddress] = (uint8) CODEPC - fixAddress - 1;
+	debug (("TAINT LABEL: %X\n", (uint) l));
+}
+
+
+static int ContextCompare (uintp pc, ContextBasicBlock *bb)
+{
+	if (pc < bb->pc_start) 	return -1;
+	if (pc > bb->pc_end) 	return 1;
+	return 0;
+}
+
+static ContextBasicBlock *findBasicBlock (const Method *meth, uintp pc)
+{
+	return (ContextBasicBlock *) bsearch ((void *) pc, meth->contexts,
+														 meth->context_count,
+														 sizeof (ContextBasicBlock),
+														 (int (*)(const void*, const void*)) ContextCompare);
+}
+
+void exceptionUnwindStack (Hjava_lang_Object *exceptObj, Method *globalMethod,
+						   uintp pc, Method *throwMethod, taint_t taint,
+						   uintp framePointer, bool lastFrame)
+{
+	if (throwMethod && taint)
+	{
+		// Block pc's are relative to start of method
+		pc -= (uintp) getMethodCodeStart(globalMethod)->code_start;
+
+		// Locate the context pointer
+		ContextBasicBlock *context = findBasicBlock (globalMethod, pc);
+		if (context)
+		{
+			if (lastFrame && context->bitmap_index >= 0)
+			{
+				// In the last frame, store the exception taint in the appropriate context part
+				taint_t *exceptTaint = framePointer + GetContextOffset (context->bitmap_index + 1);
+				*exceptTaint = taint;
+			}
+
+			taint_trace_native (2, ("UNWIND: %s.%s: %d: <%d-%d>", globalMethod->class->name->data, globalMethod->name->data,
+				pc, context->pc_start, context->pc_end));
+
+			// Try to determine which throws clause this is.
+			int index = -1;
+			int i;
+			for (i = 0; i < throwMethod->ndeclared_exceptions; i++)
+			{
+				errorInfo einfo;
+				Hjava_lang_Class *except = getClass (throwMethod->declared_exceptions[i], globalMethod->class, &einfo);
+				if (classExtends2 (exceptObj->vtable->class, except))
+				{
+					// Found it
+					index = i;
+					break;
+				}
+			}
+
+			if (index < 0)
+			{
+				// TODO?: runtime exception
+			}
+			else
+			{
+				const StorageRecord *stores = &context->store_cases[index + 1];
+				const StorageEntry  *entry;
+				if (!STORAGE_IS_EMPTY (stores) || stores->has_throw)
+				{
+					if (stores->has_throw)
+					{
+						trishulAddFallbackContext (taint);
+					}
+
+					if (lastFrame)
+					{
+						/* In the JIT, there is no chance to evaluate a method call that may cause an exception
+						 * after returnung to the stack frame from which the method is called. Therefore,
+						 * in this last frame, we also taint any locals, as they may exist after the catch
+						 * block is executed.
+						 */
+						if (stores->quick_locals)
+						{
+							uint i;
+							for (i = 0; i < sizeof (stores->quick_locals) * 8; i++)
+							{
+								if (stores->quick_locals & (1 << i))
+								{
+									// For this to work, the frame method parameter must be called globalMethod,
+									// as the SLOT2LOCALOFFSET_TAINT macro expects to be executed at code-generation.
+									taintAdd1 (*(taint_t *) (framePointer + SLOT2LOCALOFFSET_TAINT (i)), taint);
+								}
+							}
+						}
+					}
+
+					/* Handle other entries */
+					for (entry = stores->first; entry; entry = entry->next)
+					{
+						switch (entry->type)
+						{
+						case STORE_LOCAL_VARIABLE:
+							if (lastFrame)
+								taintAdd1 (*(taint_t *) (framePointer + SLOT2LOCALOFFSET_TAINT (i)), taint);
+							break;
+						case STORE_FIELD_STATIC:
+							if (entry->param.field_static.field->noTaint)
+							{
+								taint_trace_native (0, ("    STATIC: No taint"));
+							}
+							else
+							{
+								taint_trace_native (2, ("    STATIC %s.%s: <- %X (| %X)",
+										entry->param.field_static.field->clazz->name->data,
+										entry->param.field_static.field->name->data,
+										entry->param.field_static.field->trishul.taint, taint));
+								taintAdd1 (entry->param.field_static.field->trishul.taint, taint);
+							}
+							break;
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+
+define_insn(do_store_nothrow_taint, do_store_nothrow_taint)
+{
+	bool 	store 	= const_int (1);
+	if (store)
+	{
+		if (currentContext && BBT_IS_CALL (currentContext->type))
+		{
+			genTaintTaintRegPush (&TAINT_NOTHROW);
+			genXMMClearPart		 (&TAINT_NOTHROW);
+		}
+	}
+	else
+	{
+		if (currentContext && BBT_IS_CALL (currentContext->type))
+		{
+			genTaintPropagate	(RM_TAINT_NOTHROW, GetContextRM (currentContext->bitmap_index + 1));
+			genTaintTaintRegPop (&TAINT_NOTHROW);
+		}
+	}
+}
+
+define_insn(keep_alive, keep_alive)
+{
+	RegMem rm = GetSlotRegMem (s, 0, false);
+	debug (("KEEP ALIVE: %s\n", debugRegMem (&rm)));
+}
+
+
+void ClearContextTaint (void)
+{
+	asm ("pshufd $0xE7, %xmm2, %xmm2");
+}

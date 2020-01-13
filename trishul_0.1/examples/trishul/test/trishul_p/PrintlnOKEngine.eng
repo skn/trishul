@@ -1,0 +1,22 @@
+package trishul.test.trishul_p;
+import trishul_p.*;
+
+/** disallows printlns
+ */
+public class PrintlnOKEngine extends Engine {
+  public Order query(Action a) {
+    aswitch(a) {
+      case <* *.*.println(..)>: return new OKOrder (this);
+    }
+    return null;
+  }
+
+  public void accept(Order s) {
+  }
+
+  public void handleResult (Action origAction, Order s, Object result, boolean wasExnThn)
+  {
+  	System.out.print ("OK\n");
+  }
+
+}

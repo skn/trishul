@@ -1,0 +1,11 @@
+
+<html>
+<head>
+   <title>SSI include</title>
+</head>
+
+<body>
+	Include file: <!--#include file="onlylocal.txt" -->
+</body>
+
+</html>

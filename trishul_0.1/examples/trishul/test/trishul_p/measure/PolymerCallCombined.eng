@@ -1,0 +1,18 @@
+package trishul.test.trishul_p.measure;
+import trishul_p.*;
+
+public class PolymerCallCombined
+extends Engine
+{
+  	public Order query (Action a)
+  	{
+    	aswitch(a)
+    	{
+      	case <int trishul.test.trishul_p.measure.PolymerCall.call1 (int i)>:
+	      	return null;
+      	case <void trishul.test.trishul_p.measure.PolymerCall.call2 (int i#<0>)>:
+	      	return null;
+    	}
+    	return null;
+  	}
+}

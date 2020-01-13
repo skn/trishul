@@ -1,0 +1,27 @@
+package trishul.test.trishul_p.ftpclient;
+
+import trishul_p.*;
+import java.io.File;
+import java.net.*;
+
+public class FTPFile
+extends Engine
+{
+	private enginetaint accessClass
+	{
+		localAccess,globalAccess,localIP,globalIP,OutsideRoot
+        }
+
+	public Order query (Action a)
+    	{
+	aswitch(a)
+	{
+		case <* java.io.*.<init>(..,String f)>:
+			System.out.println("Accessing file " + f);
+			break;
+	}
+	return null;
+	//new UnregOrder(this,a); <--- doesn't work
+	}
+}
+

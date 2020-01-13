@@ -1,0 +1,6 @@
+html: text/html,/images/text.gif
+shtml: text/shtml,/images/text.gif
+htm: text/html,/images/text.gif
+gif: image/gif,images/giffile.gif
+txt: text/plain,/images/text.gif
+: application/directory,/images/folder.gif

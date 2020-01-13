@@ -1,0 +1,11 @@
+
+<html>
+<head>
+   <title>SSI include</title>
+</head>
+
+<body>
+	Include virtual: <!--#include virtual="onlylocal.txt" -->
+</body>
+
+</html>

@@ -1,0 +1,42 @@
+package trishul.test.trishul_p;
+
+import trishul_p.*;
+
+public class NamedTaints
+extends Engine
+{
+	private enginetaint MyTaintType1
+	{
+		taintValue1, taintValue2
+	}
+
+	private enginetaint MyTaintType
+	extends MyTaintType1
+	{
+		taintValue3, taintValue4
+	}
+
+
+  	public Order query (Action a)
+  	{
+    	aswitch(a)
+    	{
+    	// Test primitive and & /
+      	case <* trishul.test.trishul_p.TestGeneric.passInt(int)>:
+      		{
+      			MyTaintType myTaintVar = #{taintValue1,taintValue2, taintValue4};
+      			System.out.print ("TAINT: " + myTaintVar + "\n");
+      		}
+      		return new RetValTaintOrder (#primitive:{taintValue2, taintValue4});
+      	case <* *.*.println(int#<{taintValue1,taintValue2, taintValue4} &>)>:
+      		System.out.print ("1 FAIL\n");
+      		return null;
+      	case <* *.*.println(int#<{taintValue1,taintValue2, taintValue4} |>)>:
+      		System.out.print ("1 OK\n");
+      		return null;
+      	}
+
+      	return null;
+     }
+}
+

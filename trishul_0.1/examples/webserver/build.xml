@@ -1,0 +1,23 @@
+<project default="compile">
+  	<property name="source" 	value="src"/>
+  	<property name="bin" 		value="bin"/>
+
+	<target
+		name="init"
+	>
+    	<mkdir dir="${bin}"/>
+  	</target>
+
+	<target name="compile" depends="init">
+		<javac
+			srcdir="${source}"
+			destdir="${bin}"
+			debug="on"
+			deprecation="true"
+		/>
+	</target>
+
+	<target name="clean">
+		<delete dir="${bin}"/>
+	</target>
+</project>

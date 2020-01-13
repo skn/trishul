@@ -1,0 +1,44 @@
+README for Trishul 0.1 Release (06 Nov. 2008)
+---------------------------------------------
+
+This is version 0.1 release of Trishul (http://www.cs.vu.nl/~srijith/trishul/)
+The code is 'graduate-level' quality and is released under the same license as 
+Kaffe -  GNU General Public License http://www.kaffe.org/ftp/pub/kaffe/COPYING
+
+
+Hope these pointers would help get you started on compiling and using Trishul:
+
+- Attempt to compile Trishul only after successfully compiling Kaffe 1.1.7
+
+- Extra libraries and tools will be needed to compile Trishul. In an Ubuntu machines
+  these should do it:
+  
+   - apt-get install sun-java5-jdk  // at least 1.5
+   - apt-get install libssl-dev     // for signing
+   - apt-get install xorg-dev       // if error with gtk+ peer missins X lib files
+   - apt-get install libgtk2.0-dev
+   - apt-get install ant
+   - install jikes, fastjar
+   - sudo update-java-alternatives -s java-1.5.0-sun
+
+- JIT mode of Trishul works only with machines having SSE2 CPU support
+
+- gcc 4.1 sometimes creates problems. We think we have sorted them out but if compile 
+  fails with weird errors, try using gcc 4.0
+
+- The keytool binary provided by GCJ is not complete. Use the one provided by Sun
+
+- Use the sample scripts in 'conf-trishul' dir of kaffe-1.1.7 to configure Trishul 
+  compliation
+
+- Use './configure --help' to see more configure options
+
+
+
+Suggested steps for getting Trishul compilation to work is as follows:
+
+- configure either the debug or release build and make it.
+- cd to the examples dir. Perform 'make' and 'make test' to check it the binaries 
+  pass all the taint tests
+- cd back to the kaffe directory and perform make install
+

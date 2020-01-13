@@ -1,0 +1,39 @@
+package trishul.test.trishul_p;
+import trishul_p.*;
+
+public class TaintTest
+extends Engine
+{
+  	public Order query (Action a)
+  	{
+    	aswitch(a)
+    	{
+    	// Test primitive and & /
+      	case <* trishul.test.trishul_p.TestGeneric.passInt(int)>:
+      		return new RetValTaintOrder (#primitive:0x03);
+      	case <* *.*.println(int#<0x07 &>)>:
+      		System.out.print ("1 FAIL\n");
+      		return null;
+      	case <* *.*.println(int#<0x07 |>)>:
+      		System.out.print ("1 OK\n");
+      		return null;
+      	case <* *.*.println(int#<0x00 |>)>:
+      		System.out.print ("1 FAIL 2\n");
+      		return null;
+
+      	// Test object taints
+      	case <* trishul.test.trishul_p.TestGeneric.passString(java.lang.String)>:
+      		return new RetValTaintOrder (#object:0x03);
+      	case <* *.*.println(java.lang.String#<0x03 &>)>:
+      		System.out.print ("2 OK\n");
+      		return null;
+      	// Test auto taints on objects
+      	case <* trishul.test.trishul_p.TestGeneric.getString()>:
+      		return new RetValTaintOrder (#auto:0x04);
+      	case <* *.*.println(java.lang.String#<0x04 &>)>:
+      		System.out.print ("3 OK\n");
+      		return null;
+    	}
+		return null;
+  	}
+}

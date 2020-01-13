@@ -1,0 +1,99 @@
+Cross compiling Kaffe
+---------------------
+
+This document provides some pointers for cross compiling the Kaffe VM.
+The 'configure' mechanism used by kaffe enables users to do cross
+compiling much easier, but still it's in the dark side...
+
+'Host', 'Target' and 'Build'
+============================
+To cross compiling a language processor (like compiler, interpreter)
+so many users are confused for the term 'host', 'target' or 'build'.
+Suppose you want to make a kaffe 'running on m68k/linux' by using
+existing development environment on 'i686/linux', you have to find
+cross-tools 'running on i686/linux' and 'generates code for m68k/linux'.
+But the language processor (in this case 'kaffe' itself), is configured
+to run on m68k/linux. Fully confused, isn't it?
+
+In configure, the flag '--host' specifies 'for what processor and OS
+you want to make this kaffe to run' and '--build' specifies 'on which
+processor and OS you want to generate this kaffe'.
+
+The other issue is how to specify cross-compiler (and some other tools)
+to the configure process. The easiest way (in my opinion) is to use
+shell's environment variable to override default behavior of 'configure'.
+
+Simple example
+==============
+Based on the discussion above, simplest configure script to use cross
+tools like 'm68k-linux-gcc' to generate kaffe for m68k/linux becomes
+
+  CC=m68k-linux-gcc NM=m68k-linux-nm AR=m68k-linux-ar \
+	../kaffe-1.1.7/configure --host=m68k-linux --build=i686-linux
+
+The other way to do the same thing is to add cross-tools bin dir into
+the PATH environment and simple configure without specifying CC etc.
+If you find m68k-linux-gcc in '/proj/cross/bin' then same gcc can be
+accessed by '/proj/cross/m68k-linux/bin/gcc' if you use default for
+installing cross-gcc. So if you add '/proj/cross/m68k-linux/bin' to
+your PATH environment variable, you need not to specify CC when you
+configure. Someone said this approach is simpler than the previous
+one, and you can decide which is better for you.
+
+And anyway, configuring and making your kaffe binary in different
+directory from source directory is a good practice. This is really
+needed for cross compiling.
+
+'kaffeh' is needed for cross compilation
+========================================
+The way how to supply options to configure is roughly ok, but it is
+not enough. Because, include files needed to compile some library
+files are generated automatically while build. This process is done
+by invoking a command 'kaffeh' while build, but the 'kaffeh' made
+in the cross compilation process is the program which can be executed
+on the 'host' computer rather than 'build' computer. The 'kaffeh' for
+the 'build' computer shall be made in advance.
+
+To do that, you first have to make and install 'native' kaffeh, and
+totally you may have three directories. In this document I use
+'kaffe-1.1.7' where you store the source code, 'kaffe-native' where
+you make native kaffe, and 'kaffe-m68k-linux' where you make cross
+compiled kaffe.
+
+Then, you have
+  . --- kaffe-1.1.7
+     +- kaffe-native
+     +- kaffe-m68k-linux
+and, you first visit 'kaffe-native' and do '../kaffe-1.1.7/configure' and
+'make; make install' first.
+
+And then, you can
+  CC=m68k-linux-gcc NM=m68k-linux-nm AR=m68k-linux-ar \
+	../kaffe-1.1.7/configure --host=m68k-linux --build=i686-linux
+
+How to test cross-built kaffe?
+==============================
+When you test cross-built kaffe, simply copying the 'kaffe-bin' to the
+target machine is not enough. At least you have to copy 'glibj.zip' file
+and native library files.
+
+To simplify this, I usually mount build directory from target machine,
+and keep the directory structure same for both build machine and target
+machine.
+
+If you want to check the completeness of your build by using regression
+tests suite in kaffe (by 'make check'), you have to check the location
+of shell is same for both build machine and target machine, or modify
+it by your hand.
+
+So where's cross tools?
+=======================
+One of the hardest thing for cross-compiling kaffe should be this. If
+you are linux user, you may be happy that you can find binary versions
+of these in several places in the internet. If you are using some
+other OS, you may need to make cross-tools from GNU's source code.
+
+I'd like to put more information for this issue in the future release
+of this document.
+
+Kiyo Inaba

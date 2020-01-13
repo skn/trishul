@@ -1,0 +1,29 @@
+package trishul.test.trishul_p.gtk;
+import trishul_p.*;
+
+public class DebugEngine
+extends Engine
+{
+  	public Order query (Action a)
+  	{
+    	aswitch(a)
+    	{
+      	case <* java.awt.EventQueue.postEvent(java.awt.AWTEvent#<7>)>:
+      		System.err.println ("A");
+	      	return new SuppressOrder ();
+      	case <* java.awt.EventQueue#<7>.postEvent(java.awt.AWTEvent)>:
+      		System.err.println ("B");
+	      	return new SuppressOrder ();
+      	case <* java.awt.Component.reshape(..)#<7>>:
+      		System.err.println ("C");
+	      	return new SuppressOrder ();
+      	case <* java.awt.Component.setBounds(..)#<7>>:
+      		System.err.println ("D");
+	      	return new SuppressOrder ();
+      	case <* trishul.test.gtk.Resize.go()#<7>>:
+      		System.err.println ("E");
+	      	return new SuppressOrder ();
+    	}
+		return null;
+  	}
+}

@@ -1,0 +1,21 @@
+
+<html>
+<head>
+   <title>SSI's</title>
+</head>
+<body bgcolor = white>
+<CENTER><B><FONT FACE="Arial,Helvetica"><FONT SIZE=+2>Server Side Include Example</FONT></FONT></B></CENTER><br>
+<img src = images/purejavalogo.gif><br><br>
+<P><FONT FACE="Arial,Helvetica">Hi !!
+<BR> you are :<b><!--#echo var="REMOTE_HOST" --></b>
+<BR> using <b><!--#echo var="HTTP_USER_AGENT" --></b>
+<BR> and you came from <b><!--#echo var="DOCUMENT_URI" --></b>
+<BR>Your current IP address assigned by your server <b><!--#echo var="SERVER_NAME" --></b> which uses the software package <b><!--#echo var="SERVER_SOFTWARE" --></b> is <b><!--#echo var="REMOTE_ADDR" --></b>
+
+<BR> Date <!--#echo var="DATE_LOCAL" -->
+<BR> Last modified <!--#echo var="LAST_MODIFIED" -->
+</font>
+<HR>
+
+</body>
+</html>

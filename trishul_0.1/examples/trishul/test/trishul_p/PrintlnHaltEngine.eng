@@ -1,0 +1,25 @@
+package trishul.test.trishul_p;
+import trishul_p.*;
+
+/** disallows printlns
+ */
+public class PrintlnHaltEngine extends Engine {
+  public Order query(Action a) {
+    aswitch(a) {
+      case <* *.*.println(..)>: return new HaltOrder ();
+    }
+    return null;
+  }
+
+  public void accept(Order s) {
+    if(s.getType () == Order.TYPE_HALT)
+    {
+    	System.out.print("Halting target ; no printlns allowed!\n");
+    }
+    /* note that if we used println here instead of print, we would
+     * induce infinite recursion, as println would call the monitor which
+     * would call println, which would then call the monitor, ....
+     */
+  }
+
+}

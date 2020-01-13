@@ -1,0 +1,56 @@
+package trishul.test.trishul_p;
+
+import trishul_p.*;
+
+public class PolymorphicTaint
+extends Engine
+{
+  	public Order query (Action a)
+  	{
+    	aswitch(a)
+    	{
+      	case <* *.Test1.getString()>:
+      		System.out.println ("T1P");
+      		break;
+      	}
+
+    	aswitch(a)
+    	{
+      	case <final * *.Test1.getString()>:
+      		System.out.println ("T1F");
+      		break;
+      	}
+
+      	aswitch (a)
+      	{
+      	case <* *.Test2.getString()>:
+      		System.out.println ("T2P");
+      		break;
+      	}
+
+      	aswitch (a)
+      	{
+      	case <final * *.Test2.getString()>:
+      		System.out.println ("T2F");
+      		break;
+      	}
+
+      	aswitch (a)
+      	{
+      	case <* *.Test3.getString()>:
+      		System.out.println ("T3P");
+      		break;
+      	}
+
+      	aswitch (a)
+      	{
+      	case <final * *.Test3.getString()>:
+      		System.out.println ("T3F");
+      		break;
+      	}
+
+      	return null;
+
+     }
+}
+

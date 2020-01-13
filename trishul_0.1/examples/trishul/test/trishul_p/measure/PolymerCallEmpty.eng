@@ -1,0 +1,16 @@
+package trishul.test.trishul_p.measure;
+import trishul_p.*;
+
+public class PolymerCallEmpty
+extends Engine
+{
+  	public Order query (Action a)
+  	{
+    	aswitch(a)
+    	{
+      	case <void trishul.test.trishul_p.measure.PolymerCall.callNever ()>:
+	      	return null;
+    	}
+    	return null;
+  	}
+}

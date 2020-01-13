@@ -1,0 +1,2 @@
+set confirm off
+run

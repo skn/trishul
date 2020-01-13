@@ -1,0 +1,26 @@
+package trishul.test.trishul_p;
+import trishul_p.*;
+
+public class TestAbstractActionTaintEngine
+extends Engine
+{
+  	public Order query (Action a)
+  	{
+    	aswitch(a)
+    	{
+    	case <* trishul.test.trishul_p.TestGeneric.passInt(int i)>:
+    		if (i == 1) return new RetValTaintOrder (new Taint (Taint.TAINT_PRIMITIVE, 8));
+    		else return new RetValTaintOrder (new Taint (Taint.TAINT_PRIMITIVE, 16));
+      	case <abstract * trishul.test.trishul_p.TestAbstractAction(int p1#<8>, String p2)>:
+	      	System.out.print ("ABSTRACT: " + p1 + " : " + p2 + "\n");
+	      	return null;
+      	case <abstract * trishul.test.trishul_p.TestAbstractAction(int p1#<16>, String p2)>:
+	      	System.out.print ("ABSTRACT2: " + p1 + " : " + p2 + "\n");
+	      	return null;
+	    case done:
+	      	System.out.print ("DONE\n");
+	      	break;
+    	}
+    	return null;
+  	}
+}

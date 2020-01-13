@@ -1,0 +1,53 @@
+package trishul.test.trishul_p.webserver;
+
+import trishul_p.*;
+import java.io.File;
+import java.net.*;
+
+public class Webserver
+extends Engine
+{
+	private enginetaint accessClass
+	{
+		localAccess,globalAccess,localIP,globalIP
+        }
+
+	public Order query (Action a)
+    	{
+	aswitch(a)
+	{
+		case <* *.Socket.getOutputStream(..)>:
+			accessClass myLevels = #{localAccess,globalAccess,localIP,globalIP};
+			Socket s= (java.net.Socket)(a.getThisPointer());
+			InetAddress addr = s.getInetAddress();
+			System.out.println("*** New Request ***");
+			System.out.println("Remote IP: " + addr.toString());//assume all are non-local for now
+			if (!addr.isLoopbackAddress()) {
+				System.out.println("Remote IP is _not_ local");
+				//return new ObjectTaintOrder (a.getThisPointer(),#object:{globalIP});
+				return new RetValTaintOrder (#auto:{globalIP});
+			}
+			System.out.println("Remote IP _is_ local");
+			break;
+		case <* java.io.FileInputStream.<init>(..,File f)>:
+			System.out.println("Accessing file" + f.getName());
+			accessClass myLevels = #{localAccess,globalAccess,localIP,globalIP};
+                	if(f.getName().indexOf ("onlylocal") >= 0) { //this can only be served to local clients
+                        	System.out.println("Accessing local-only file");
+				return new ObjectTaintOrder (a.getThisPointer(),#object:{localAccess});
+			}
+			break;
+		//case <* *.*.getOutputStream()#<{globalIP}>>:
+                //        System.out.println("outputstream tainted with globalIP");
+		//	return new ObjectTaintOrder (a.getThisPointer(),#object:{globalIP});
+		case <* java.io.PrintStream.<init>(..#<{globalIP}>)>:
+                        System.out.println("printstream init tainted with globalIP");
+			break;
+		case <* *.PrintStream#<{globalIP}>.write(..#<{localAccess}>)>:
+			System.out.println("== Forbidden access of local file using nonlocalIP ==");
+			break;
+	}
+	return null;//new UnregOrder(this,a);
+	}
+}
+

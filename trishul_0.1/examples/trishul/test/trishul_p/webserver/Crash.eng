@@ -1,0 +1,23 @@
+package trishul.test.trishul_p.webserver;
+
+import trishul_p.*;
+import java.io.File;
+import java.net.*;
+
+public class Crash
+extends Engine
+{
+    public Order query (Action a)
+    {
+            aswitch(a)
+            {
+            case <* *.*.accept(SocketImpl s)>:
+                        System.out.println("Test");
+                        break;
+             case <* java.io.File.<init>(String path,..)>:
+                        System.out.println("File");
+                        return null;
+            }
+        return null;
+    }
+}

@@ -1,0 +1,2751 @@
+
+/**
+ * Copyright © 2002 Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
+ * California 95054, U.S.A. All rights reserved.  Sun Microsystems, Inc. has
+ * intellectual property rights relating to technology embodied in the product
+ * that is described in this document. In particular, and without limitation,
+ * these intellectual property rights may include one or more of the U.S.
+ * patents listed at http://www.sun.com/patents and one or more additional
+ * patents or pending patent applications in the U.S. and in other countries.
+ * U.S. Government Rights - Commercial software. Government users are subject
+ * to the Sun Microsystems, Inc. standard license agreement and applicable
+ * provisions of the FAR and its supplements.  Use is subject to license terms.
+ * Sun,  Sun Microsystems,  the Sun logo and  Java are trademarks or registered
+ * trademarks of Sun Microsystems, Inc. in the U.S. and other countries.  This
+ * product is covered and controlled by U.S. Export Control laws and may be
+ * subject to the export or import laws in other countries.  Nuclear, missile,
+ * chemical biological weapons or nuclear maritime end uses or end users,
+ * whether direct or indirect, are strictly prohibited.  Export or reexport
+ * to countries subject to U.S. embargo or to entities identified on U.S.
+ * export exclusion lists, including, but not limited to, the denied persons
+ * and specially designated nationals lists is strictly prohibited.
+ */
+
+options {
+  LOOKAHEAD=1;
+  STATIC=false;
+  CACHE_TOKENS=true;
+  ERROR_REPORTING = true;
+  JAVA_UNICODE_ESCAPE=false;
+  UNICODE_INPUT=true;
+  DEBUG_PARSER=false;
+  DEBUG_LOOKAHEAD=false;
+  DEBUG_TOKEN_MANAGER=false;
+}
+
+PARSER_BEGIN(JavaParser)
+package japa.parser;
+
+import japa.parser.ast.*;
+import japa.parser.ast.body.*;
+import japa.parser.ast.expr.*;
+import japa.parser.ast.stmt.*;
+import japa.parser.ast.type.*;
+import java.io.*;
+import java.util.*;
+import trishul_p.*;
+
+/**
+ * Grammar to parse Java version 1.5
+ * @author Sreenivasa Viswanadha - Simplified and enhanced for 1.5
+ * @author J�lio Vilmar Gesser - bug fixes and added AST generation
+ */
+final public class JavaParser {
+
+    private static JavaParser parser;
+    private String inputPath;
+    private List<EngineTaintDeclaration> engineTaints;
+
+    public static CompilationUnit parse(String path, InputStream in) throws ParseException {
+    	if (parser == null) {
+            parser = new JavaParser(in);
+        } else {
+            parser.ReInit(in);
+        }
+        parser.inputPath 	= path;
+        parser.engineTaints = new LinkedList<EngineTaintDeclaration> ();
+        return parser.CompilationUnit();
+    }
+
+    public static CompilationUnit parse(String path, File file) throws ParseException {
+        try {
+	        FileInputStream in = new FileInputStream(file);
+	        try {
+	        	return parse(path, in);
+	        } finally {
+	        	in.close();
+	        }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private List add(List list, Object obj) {
+    	if (list == null) {
+    		list = new LinkedList();
+    	}
+    	list.add(obj);
+    	return list;
+    }
+
+	private class Modifier {
+
+		final int modifiers;
+		final List annotations;
+
+		public Modifier(int modifiers, List annotations) {
+			this.modifiers = modifiers;
+			this.annotations = annotations;
+		}
+
+	}
+
+	private Location locationFromToken (Token token)
+	{
+		return new Location (inputPath, token.beginLine, token.beginColumn);
+	}
+
+
+	private class ParseException
+	extends japa.parser.ParseException
+	{
+ 		public ParseException (Token currentTokenVal,
+                        	   int[][] expectedTokenSequencesVal,
+                        	   String[] tokenImageVal)
+  		{
+    		super (currentTokenVal, expectedTokenSequencesVal, tokenImageVal);
+  		}
+
+  		public ParseException ()
+  		{
+    		super();
+ 		}
+
+  		public ParseException (Token currentTokenVal, String message)
+  		{
+    		super (message);
+    		currentToken = currentTokenVal;
+  		}
+  	}
+
+
+    /**
+     * Adds the given modifier.
+     */
+    public int addModifierToSet (int modifiers, int mod, Token token)
+    throws ParseException
+    {
+        if ((modifiers & mod) != 0)
+        {
+            throw new ParseException(token, "Duplicated modifier");
+        }
+        return modifiers |= mod;
+    }
+
+    private int parseInt (String s)
+    {
+    	if (s.charAt (0) == '0')
+    	{
+    		if (s.length () > 1 && s.charAt (1) == 'x')
+    			return Integer.parseInt (s.substring (2), 16);
+    		return Integer.parseInt (s, 8);
+    	}
+		return Integer.parseInt (s, 10);
+    }
+}
+
+PARSER_END(JavaParser)
+
+/* WHITE SPACE */
+
+SKIP :
+{
+  " "
+| "\t"
+| "\n"
+| "\r"
+| "\f"
+}
+
+/* COMMENTS */
+
+MORE :
+{
+  "//" : IN_SINGLE_LINE_COMMENT
+|
+  <"/**" ~["/"]> { input_stream.backup(1); } : IN_FORMAL_COMMENT
+|
+  "/*" : IN_MULTI_LINE_COMMENT
+}
+
+<IN_SINGLE_LINE_COMMENT>
+SPECIAL_TOKEN :
+{
+  <SINGLE_LINE_COMMENT: "\n" | "\r" | "\r\n" > : DEFAULT
+}
+
+<IN_FORMAL_COMMENT>
+SPECIAL_TOKEN :
+{
+  <FORMAL_COMMENT: "*/" > : DEFAULT
+}
+
+<IN_MULTI_LINE_COMMENT>
+SPECIAL_TOKEN :
+{
+  <MULTI_LINE_COMMENT: "*/" > : DEFAULT
+}
+
+<IN_SINGLE_LINE_COMMENT,IN_FORMAL_COMMENT,IN_MULTI_LINE_COMMENT>
+MORE :
+{
+  < ~[] >
+}
+
+/* RESERVED WORDS AND LITERALS */
+
+TOKEN :
+{
+  < ABSTRACT: "abstract" >
+| < ASSERT: "assert" >
+| < BOOLEAN: "boolean" >
+| < BREAK: "break" >
+| < BYTE: "byte" >
+| < CASE: "case" >
+| < CATCH: "catch" >
+| < CHAR: "char" >
+| < CLASS: "class" >
+| < CONST: "const" >
+| < CONTINUE: "continue" >
+| < _DEFAULT: "default" >
+| < DO: "do" >
+| < DOUBLE: "double" >
+| < ELSE: "else" >
+| < ENUM: "enum" >
+| < EXTENDS: "extends" >
+| < FALSE: "false" >
+| < FINAL: "final" >
+| < FINALLY: "finally" >
+| < FLOAT: "float" >
+| < FOR: "for" >
+| < GOTO: "goto" >
+| < IF: "if" >
+| < IMPLEMENTS: "implements" >
+| < IMPORT: "import" >
+| < INSTANCEOF: "instanceof" >
+| < INT: "int" >
+| < INTERFACE: "interface" >
+| < LONG: "long" >
+| < NATIVE: "native" >
+| < NEW: "new" >
+| < NULL: "null" >
+| < PACKAGE: "package">
+| < PRIVATE: "private" >
+| < PROTECTED: "protected" >
+| < PUBLIC: "public" >
+| < RETURN: "return" >
+| < SHORT: "short" >
+| < STATIC: "static" >
+| < STRICTFP: "strictfp" >
+| < SUPER: "super" >
+| < SWITCH: "switch" >
+| < SYNCHRONIZED: "synchronized" >
+| < THIS: "this" >
+| < THROW: "throw" >
+| < THROWS: "throws" >
+| < TRANSIENT: "transient" >
+| < TRUE: "true" >
+| < TRY: "try" >
+| < VOID: "void" >
+| < VOLATILE: "volatile" >
+| < WHILE: "while" >
+| < TRISHULTAINT: "trishultaint" >
+| < NOTRISHULTAINT: "notrishultaint" >
+| < NOTRISHULFALLBACK: "notrishulfallback" >
+| < ENGINETAINT: "enginetaint" >
+| < ASWITCH: "aswitch" >
+| < ACTION_ABSTRACT: "abs" >
+| < ACTION_DONE: "done" >
+}
+
+/* LITERALS */
+
+TOKEN :
+{
+  < LONG_LITERAL:
+        <DECIMAL_LITERAL> (["l","L"])
+      | <HEX_LITERAL> (["l","L"])
+      | <OCTAL_LITERAL> (["l","L"])
+  >
+|
+  < INTEGER_LITERAL:
+        <DECIMAL_LITERAL>
+      | <HEX_LITERAL>
+      | <OCTAL_LITERAL>
+  >
+|
+  < #DECIMAL_LITERAL: ["1"-"9"] (["0"-"9"])* >
+|
+  < #HEX_LITERAL: "0" ["x","X"] (["0"-"9","a"-"f","A"-"F"])+ >
+|
+  < #OCTAL_LITERAL: "0" (["0"-"7"])* >
+|
+  < FLOATING_POINT_LITERAL:
+        (["0"-"9"])+ "." (["0"-"9"])* (<EXPONENT>)? (["f","F","d","D"])?
+      | "." (["0"-"9"])+ (<EXPONENT>)? (["f","F","d","D"])?
+      | (["0"-"9"])+ <EXPONENT> (["f","F","d","D"])?
+      | (["0"-"9"])+ (<EXPONENT>)? ["f","F","d","D"]
+  >
+|
+  < #EXPONENT: ["e","E"] (["+","-"])? (["0"-"9"])+ >
+|
+  < CHARACTER_LITERAL:
+      "'"
+      (   (~["'","\\","\n","\r"])
+        | ("\\"
+            ( ["n","t","b","r","f","\\","'","\""]
+            | ["0"-"7"] ( ["0"-"7"] )?
+            | ["0"-"3"] ["0"-"7"] ["0"-"7"]
+            )
+          )
+        | ("\\u"
+        	["0"-"9","A"-"F","a"-"f"]
+        	["0"-"9","A"-"F","a"-"f"]
+        	["0"-"9","A"-"F","a"-"f"]
+        	["0"-"9","A"-"F","a"-"f"]
+          )
+      )
+      "'"
+  >
+|
+  < STRING_LITERAL:
+      "\""
+      (   (~["\"","\\","\n","\r"])
+        | ("\\"
+            ( ["n","t","b","r","f","\\","'","\""]
+            | ["0"-"7"] ( ["0"-"7"] )?
+            | ["0"-"3"] ["0"-"7"] ["0"-"7"]
+            )
+          )
+        | ("\\u"
+        	["0"-"9","A"-"F","a"-"f"]
+        	["0"-"9","A"-"F","a"-"f"]
+        	["0"-"9","A"-"F","a"-"f"]
+        	["0"-"9","A"-"F","a"-"f"]
+          )
+      )*
+      "\""
+  >
+}
+
+/* IDENTIFIERS */
+
+TOKEN :
+{
+  < IDENTIFIER: <LETTER> (<LETTER>|<DIGIT>)* >
+|
+  < #LETTER:
+      [
+       "\u0024",
+       "\u0041"-"\u005a",
+       "\u005f",
+       "\u0061"-"\u007a",
+       "\u00c0"-"\u00d6",
+       "\u00d8"-"\u00f6",
+       "\u00f8"-"\u00ff",
+       "\u0100"-"\u1fff",
+       "\u3040"-"\u318f",
+       "\u3300"-"\u337f",
+       "\u3400"-"\u3d2d",
+       "\u4e00"-"\u9fff",
+       "\uf900"-"\ufaff"
+      ]
+  >
+|
+  < #DIGIT:
+      [
+       "\u0030"-"\u0039",
+       "\u0660"-"\u0669",
+       "\u06f0"-"\u06f9",
+       "\u0966"-"\u096f",
+       "\u09e6"-"\u09ef",
+       "\u0a66"-"\u0a6f",
+       "\u0ae6"-"\u0aef",
+       "\u0b66"-"\u0b6f",
+       "\u0be7"-"\u0bef",
+       "\u0c66"-"\u0c6f",
+       "\u0ce6"-"\u0cef",
+       "\u0d66"-"\u0d6f",
+       "\u0e50"-"\u0e59",
+       "\u0ed0"-"\u0ed9",
+       "\u1040"-"\u1049"
+      ]
+  >
+}
+
+/* SEPARATORS */
+
+TOKEN :
+{
+  < LPAREN: "(" >
+| < RPAREN: ")" >
+| < LBRACE: "{" >
+| < RBRACE: "}" >
+| < LBRACKET: "[" >
+| < RBRACKET: "]" >
+| < SEMICOLON: ";" >
+| < COMMA: "," >
+| < DOT: "." >
+| < AT: "@" >
+}
+
+/* OPERATORS */
+
+TOKEN :
+{
+  < ASSIGN: "=" >
+| < LT: "<" >
+| < BANG: "!" >
+| < TILDE: "~" >
+| < HOOK: "?" >
+| < COLON: ":" >
+| < EQ: "==" >
+| < LE: "<=" >
+| < GE: ">=" >
+| < NE: "!=" >
+| < SC_OR: "||" >
+| < SC_AND: "&&" >
+| < INCR: "++" >
+| < DECR: "--" >
+| < PLUS: "+" >
+| < MINUS: "-" >
+| < STAR: "*" >
+| < SLASH: "/" >
+| < BIT_AND: "&" >
+| < BIT_OR: "|" >
+| < XOR: "^" >
+| < REM: "%" >
+| < LSHIFT: "<<" >
+| < PLUSASSIGN: "+=" >
+| < MINUSASSIGN: "-=" >
+| < STARASSIGN: "*=" >
+| < SLASHASSIGN: "/=" >
+| < ANDASSIGN: "&=" >
+| < ORASSIGN: "|=" >
+| < XORASSIGN: "^=" >
+| < REMASSIGN: "%=" >
+| < LSHIFTASSIGN: "<<=" >
+| < RSIGNEDSHIFTASSIGN: ">>=" >
+| < RUNSIGNEDSHIFTASSIGN: ">>>=" >
+| < ELLIPSIS: "..." >
+}
+
+/* >'s need special attention due to generics syntax. */
+TOKEN :
+{
+  < RUNSIGNEDSHIFT: ">>>" >
+  {
+     matchedToken.kind = GT;
+     ((Token.GTToken)matchedToken).realKind = RUNSIGNEDSHIFT;
+     input_stream.backup(2);
+  }
+| < RSIGNEDSHIFT: ">>" >
+  {
+     matchedToken.kind = GT;
+     ((Token.GTToken)matchedToken).realKind = RSIGNEDSHIFT;
+     input_stream.backup(1);
+  }
+| < GT: ">" >
+}
+
+
+/*****************************************
+ * THE JAVA LANGUAGE GRAMMAR STARTS HERE *
+ *****************************************/
+
+/*
+ * Program structuring syntax follows.
+ */
+
+CompilationUnit CompilationUnit():
+{
+	NameExpr pakage = null;
+	List imports = null;
+	ImportDeclaration in = null;
+	List types = null;
+	TypeDeclaration tn = null;
+	Location		location = null;
+}
+{
+	[
+		pakage = PackageDeclaration()  {location = locationFromToken (token);}
+	]
+
+	(
+		in = ImportDeclaration()
+			{
+				if (location == null) location = locationFromToken (token);
+				imports = add(imports, in);
+			}
+	)*
+	(
+		tn = TypeDeclaration()
+			{
+				if (location == null) location = locationFromToken (token);
+				types = add(types, tn);
+			}
+	)*
+	<EOF>
+
+	{
+		if (location == null) location = locationFromToken (token);
+		return new CompilationUnit (location, pakage, imports, types, engineTaints);
+	}
+}
+
+NameExpr PackageDeclaration():
+{
+	NameExpr ret;
+}
+{
+  "package" ret = Name() ";"
+  { return ret; }
+}
+
+ImportDeclaration ImportDeclaration():
+{
+	NameExpr 	name;
+	boolean 	isStatic 	= false;
+	boolean 	isAsterisk 	= false;
+	Location	location;
+}
+{
+  	"import" {location = locationFromToken (token);}
+  	[ "static" { isStatic = true; } ]
+  	name = Name()
+  	[ "." "*" { isAsterisk = true; } ]
+  	";"
+
+  	{ return new ImportDeclaration (location, name, isStatic, isAsterisk); }
+}
+
+/*
+ * Modifiers. We match all modifiers in a single rule to reduce the chances of
+ * syntax errors for simple modifier mistakes. It will also enable us to give
+ * better error messages.
+ */
+
+Modifier Modifiers():
+{
+   int modifiers = 0;
+   List annotations = null;
+   AnnotationExpr ann;
+}
+{
+ (
+  LOOKAHEAD(2)
+  (
+   "public" { modifiers = addModifierToSet(modifiers, ModifierSet.PUBLIC, token); }
+  |
+   "static" { modifiers = addModifierToSet(modifiers, ModifierSet.STATIC, token); }
+  |
+   "protected" { modifiers = addModifierToSet(modifiers, ModifierSet.PROTECTED, token); }
+  |
+   "private" { modifiers = addModifierToSet(modifiers, ModifierSet.PRIVATE, token); }
+  |
+   "final" { modifiers = addModifierToSet(modifiers, ModifierSet.FINAL, token); }
+  |
+   "abstract" { modifiers = addModifierToSet(modifiers, ModifierSet.ABSTRACT, token); }
+  |
+   "synchronized" { modifiers = addModifierToSet(modifiers, ModifierSet.SYNCHRONIZED, token); }
+  |
+   "native" { modifiers = addModifierToSet(modifiers, ModifierSet.NATIVE, token); }
+  |
+   "transient" { modifiers = addModifierToSet(modifiers, ModifierSet.TRANSIENT, token); }
+  |
+   "volatile" { modifiers = addModifierToSet(modifiers, ModifierSet.VOLATILE, token); }
+  |
+   "strictfp" { modifiers = addModifierToSet(modifiers, ModifierSet.STRICTFP, token); }
+  |
+   "notrishultaint" { modifiers = addModifierToSet(modifiers, ModifierSet.NOTRISHULTAINT, token); }
+  |
+   "notrishulfallback" { modifiers = addModifierToSet(modifiers, ModifierSet.NOTRISHULFALLBACK, token); }
+  |
+   ann = Annotation() { annotations = add(annotations, ann); }
+  )
+ )*
+
+ {
+    return new Modifier(modifiers, annotations);
+ }
+}
+
+/*
+ * Declaration syntax follows.
+ */
+TypeDeclaration TypeDeclaration():
+{
+   Modifier modifier;
+   TypeDeclaration ret;
+}
+{
+  ";" { return new EmptyTypeDeclaration(locationFromToken (token)); }
+|
+  modifier = Modifiers()
+  (
+     ret = ClassOrInterfaceDeclaration(modifier)
+   |
+     ret = TrishulTaintDeclaration(modifier)
+   |
+     ret = EnumDeclaration(modifier)
+   |
+     ret = AnnotationTypeDeclaration(modifier)
+  )
+  { return ret; }
+}
+
+
+ClassOrInterfaceDeclaration ClassOrInterfaceDeclaration(Modifier modifier):
+{
+   	boolean isInterface = false;
+   	String name;
+   	List typePar = null;
+   	ClassOrInterfaceType ext = null;
+   	List impList = null;
+   	List members;
+	Location	location;
+}
+{
+  ( "class" | "interface" { isInterface = true; } ) {location = locationFromToken (token);}
+  <IDENTIFIER> { name = token.image; }
+  [ typePar = TypeParameters() ]
+  [ ext = Extends(isInterface) ]
+  [ impList = ImplementsList(isInterface) ]
+  members = ClassOrInterfaceBody(isInterface)
+
+  	{
+  		return new ClassOrInterfaceDeclaration (location, modifier.modifiers, modifier.annotations,
+  												isInterface, name, typePar, ext, impList, members);
+  	}
+}
+
+TrishulTaintDeclaration TrishulTaintDeclaration(Modifier modifier):
+{
+   String name;
+   List typePar = null;
+   List members;
+   List impList = null;
+   Location location;
+
+}
+{
+  ( "trishultaint" ) {location = locationFromToken (token);}
+  <IDENTIFIER> { name = token.image; }
+  [ typePar = TypeParameters() ]
+  [
+  	Extends(false)
+  		{
+        	throw new ParseException(token, "trishultaint may not extend classes");
+        }
+  ]
+  [
+  	impList = ImplementsList(false)
+  ]
+  members = ClassOrInterfaceBody(false)
+
+  { return new TrishulTaintDeclaration(location, modifier.modifiers, modifier.annotations, name, typePar, impList, members); }
+}
+
+ClassOrInterfaceType Extends(boolean isInterface):
+{
+   boolean extendsMoreThanOne = false;
+   List<ClassOrInterfaceType> ret = new LinkedList();
+   ClassOrInterfaceType cit;
+}
+{
+   "extends" cit = ClassOrInterfaceType() { ret.add(cit); }
+   ( "," cit = ClassOrInterfaceType() { ret.add(cit); extendsMoreThanOne = true; } )*
+   {
+      if (extendsMoreThanOne && !isInterface)
+         throw new ParseException(token, "A class cannot extend more than one other class");
+   }
+   {
+   		return ret == null ? null : ret.get (0);
+   }
+}
+
+List ImplementsList(boolean isInterface):
+{
+   List ret = new LinkedList();
+   ClassOrInterfaceType cit;
+}
+{
+   "implements" cit = ClassOrInterfaceType() { ret.add(cit); }
+   ( "," cit = ClassOrInterfaceType() { ret.add(cit); } )*
+   {
+      if (isInterface)
+         throw new ParseException(token, "An interface cannot implement other interfaces");
+   }
+   { return ret; }
+}
+
+EnumDeclaration EnumDeclaration(Modifier modifier):
+{
+	String name;
+	List impList = null;
+	EnumConstantDeclaration entry;
+	List entries = null;
+	BodyDeclaration member;
+	List members = null;
+	Location location;
+
+}
+{
+  "enum" {location = locationFromToken (token);} <IDENTIFIER> { name = token.image; }
+  [ impList = ImplementsList(false) ]
+  "{"
+  	[
+    	{ entries = new LinkedList(); }
+    	entry = EnumConstant() { entries.add(entry); } ( LOOKAHEAD(2) "," entry = EnumConstant() { entries.add(entry); } )*
+  	]
+ 	[
+ 		","
+ 	  |
+ 	 	( ";" ( member = ClassOrInterfaceBodyDeclaration(false) { members = add(members, member); } )* )
+ 	]
+  "}"
+
+  { return new EnumDeclaration(location, modifier.modifiers, modifier.annotations, name, impList, entries, members); }
+}
+
+
+EnumConstantDeclaration EnumConstant():
+{
+	String name;
+	List args = null;
+	List classBody = null;
+	Location location;
+
+}
+{
+  <IDENTIFIER> { name = token.image; location = locationFromToken (token);} [ args = Arguments() ] [ classBody = ClassOrInterfaceBody(false) ]
+  { return new EnumConstantDeclaration(location, name, args, classBody);  }
+}
+
+List<TypeParameter> TypeParameters():
+{
+	List<TypeParameter> ret = new LinkedList<TypeParameter> ();
+	TypeParameter tp;
+}
+{
+   "<"   tp = TypeParameter() { ret.add(tp); }
+   ( "," tp = TypeParameter() { ret.add(tp); } )* ">"
+   { return ret; }
+}
+
+TypeParameter TypeParameter():
+{
+	String name;
+	List typeBound = null;
+	Location location;
+
+}
+{
+	<IDENTIFIER>
+   		{ name = token.image; location = locationFromToken (token);}
+	[ typeBound = TypeBound() ]
+   	{ return new TypeParameter (location, name, typeBound); }
+}
+
+List TypeBound():
+{
+	List ret = new LinkedList();
+	ClassOrInterfaceType cit;
+}
+{
+   "extends" cit = ClassOrInterfaceType() { ret.add(cit); }
+   ( "&"     cit = ClassOrInterfaceType() { ret.add(cit); } )*
+   { return ret; }
+}
+
+List ClassOrInterfaceBody(boolean isInterface):
+{
+	List ret = new LinkedList();
+	BodyDeclaration member;
+}
+{
+  "{" ( member = ClassOrInterfaceBodyDeclaration(isInterface) { ret.add(member); }  )* "}"
+  { return ret; }
+}
+
+BodyDeclaration ClassOrInterfaceBodyDeclaration(boolean isInterface):
+{
+   boolean isNestedInterface = false;
+   Modifier modifier;
+   BodyDeclaration ret;
+}
+{
+  (
+	  LOOKAHEAD(2)
+	  ret = Initializer()
+	  {
+	     if (isInterface)
+	        throw new ParseException(token, "An interface cannot have initializers");
+	  }
+	|
+	  modifier = Modifiers() // Just get all the modifiers out of the way. If you want to do
+	              // more checks, pass the modifiers down to the member
+	  (
+	      ret = ClassOrInterfaceDeclaration(modifier)
+	    |
+	      ret = EnumDeclaration(modifier)
+	    |
+	      ret = AnnotationTypeDeclaration(modifier)
+	    |
+	      LOOKAHEAD( [ TypeParameters() ] <IDENTIFIER> "(" )
+	      ret = ConstructorDeclaration(modifier)
+	    |
+	      LOOKAHEAD( Type() <IDENTIFIER> ( "[" "]" )* ( "," | "=" | ";" ) )
+	      ret = FieldDeclaration(modifier)
+	    |
+	      ret = MethodDeclaration(modifier)
+	    |
+	      ret = EngineTaintDeclaration(modifier)
+	  )
+	|
+	  ";" { ret = new EmptyMemberDeclaration(locationFromToken (token)); }
+  )
+  { return ret; }
+}
+
+FieldDeclaration FieldDeclaration(Modifier modifier):
+{
+	Type type;
+	List variables = new LinkedList();
+	VariableDeclarator val;
+}
+{
+  // Modifiers are already matched in the caller
+  type = Type()
+        val = VariableDeclarator() { variables.add(val); }
+  ( "," val = VariableDeclarator() { variables.add(val); } )* ";"
+
+  { return new FieldDeclaration(type.getLocation (), modifier.modifiers, modifier.annotations, type, variables); }
+}
+
+VariableDeclarator VariableDeclarator():
+{
+	VariableDeclaratorId id;
+	Expression init = null;
+}
+{
+  id = VariableDeclaratorId() [ "=" init = VariableInitializer() ]
+  { return new  VariableDeclarator(id.getLocation (), id, init); }
+}
+
+VariableDeclaratorId VariableDeclaratorId():
+{
+	String name;
+	int arrayCount = 0;
+	Location location;
+
+}
+{
+  <IDENTIFIER> { name = token.image; location = locationFromToken (token);}  ( "[" "]" { arrayCount++; } )*
+  { return new VariableDeclaratorId(location, name, arrayCount); }
+}
+
+Expression VariableInitializer():
+{
+	Expression ret;
+}
+{
+  (
+	  ret = ArrayInitializer()
+	|
+	  ret = Expression()
+  )
+  { return ret;}
+}
+
+ArrayInitializerExpr ArrayInitializer():
+{
+	List values = null;
+	Expression val;
+	Location location;
+
+}
+{
+  "{" {location = locationFromToken (token);} [ val = VariableInitializer() { values = add(values, val); } ( LOOKAHEAD(2) "," val = VariableInitializer() { values = add(values, val); } )* ] [ "," ] "}"
+  { return new ArrayInitializerExpr(location, values); }
+}
+
+MethodDeclaration MethodDeclaration(Modifier modifier):
+{
+	List<TypeParameter> typeParameters = null;
+	Type type;
+	String name;
+	List parameters;
+	int arrayCount = 0;
+	List throws_ = null;
+	BlockStmt 	block 		= null;
+	Location	location 	= null;
+}
+{
+  	// Modifiers already matched in the caller!
+  	[
+  		typeParameters = TypeParameters()
+  			{ location = typeParameters.get (0).getLocation (); }
+  	]
+
+  	type = ResultType()
+  		{if (location == null) location = type.getLocation ();}
+  	<IDENTIFIER>
+  		{ name = token.image; }
+  	parameters = FormalParameters()
+  		( "[" "]" { arrayCount++; } )*
+  	[ "throws" throws_ = NameList() ]
+  	( block = Block() | ";" )
+
+  	{ return new MethodDeclaration (location, modifier.modifiers, modifier.annotations, typeParameters, type, name,
+  									parameters, arrayCount, throws_, block); }
+}
+
+List FormalParameters():
+{
+	List ret = null;
+	Parameter par;
+}
+{
+  "(" [ par = FormalParameter() { ret = add(ret, par); } ( "," par = FormalParameter() { ret = add(ret, par); } )* ] ")"
+
+  { return ret; }
+}
+
+Parameter FormalParameter():
+{
+	Modifier modifier;
+	Type type;
+	boolean isVarArg = false;
+	VariableDeclaratorId id;
+}
+{
+  modifier = Modifiers() type = Type() [ "..." { isVarArg = true;} ] id = VariableDeclaratorId()
+
+  { return new Parameter(type.getLocation (), modifier.modifiers, modifier.annotations, type, isVarArg, id); }
+}
+
+ConstructorDeclaration ConstructorDeclaration(Modifier modifier):
+{
+	List<TypeParameter> typeParameters = null;
+	String name;
+	List parameters;
+	List throws_ = null;
+	List stmts;
+	Location	location = null;
+	Location	blockLocation;
+	BlockStmt	block;
+}
+{
+	[
+		typeParameters = TypeParameters()
+		{
+			location = typeParameters.get (0).getLocation ();
+		}
+	]
+
+  	// Modifiers matched in the caller
+  	<IDENTIFIER>
+  	{
+  		 name = token.image;
+  		 if (location == null)
+  		 {
+  		 	location = locationFromToken (token);
+  		 }
+  	}
+
+  	parameters = FormalParameters()
+
+  	[ "throws" throws_ = NameList() ]
+
+  	block = Block()
+
+  	{
+  		return new ConstructorDeclaration (location, modifier.modifiers, modifier.annotations, typeParameters,
+  											name, parameters, throws_, block);
+  	}
+}
+
+ExplicitConstructorInvocationStmt ExplicitConstructorInvocation():
+{
+	boolean isThis = false;
+	List args;
+	Location location;
+
+}
+{
+  (
+	  "super" {location = locationFromToken (token);} args = Arguments() ";"
+  )
+  { return new ExplicitConstructorInvocationStmt(location, isThis, null, args); }
+}
+
+List Statements():
+{
+	List ret = null;
+	Statement stmt;
+}
+{
+	( stmt = BlockStatement() { ret = add(ret, stmt); } )*
+	{ return ret; }
+}
+
+InitializerDeclaration Initializer():
+{
+	BlockStmt block;
+	Location	location = null;
+}
+{
+  	[
+  		"static"
+  			{location = locationFromToken (token);}
+  	]
+  	block = Block()
+  		{if (location == null) location = block.getLocation ();}
+  	{ return new InitializerDeclaration (location, block); }
+}
+
+
+/*
+ * Type, name and expression syntax follows.
+ */
+
+Type Type():
+{
+	Type ret;
+}
+{
+ (
+   LOOKAHEAD(2) ret = ReferenceType()
+ |
+   ret = PrimitiveType()
+ )
+ { return ret; }
+}
+
+ReferenceType ReferenceType():
+{
+	Type type;
+	int arrayCount = 0;
+}
+{
+  (
+   type = PrimitiveType() ( LOOKAHEAD(2) "[" "]" { arrayCount++; } )+
+  |
+   type = ClassOrInterfaceType() ( LOOKAHEAD(2) "[" "]" { arrayCount++; } )*
+  )
+  { return new ReferenceType(type.getLocation (), type, arrayCount); }
+}
+
+ClassOrInterfaceType ClassOrInterfaceType():
+{
+	ClassOrInterfaceType ret;
+	String name;
+	List typeArgs = null;
+	Location location;
+
+}
+{
+  <IDENTIFIER> {location = locationFromToken (token);} { name = token.image; } [ LOOKAHEAD(2) typeArgs = TypeArguments() ] { ret = new ClassOrInterfaceType(location, null, name, typeArgs); }
+  ( LOOKAHEAD(2) "." <IDENTIFIER> { name = token.image; } [ LOOKAHEAD(2) typeArgs = TypeArguments() ] { ret = new ClassOrInterfaceType(location, ret, name, typeArgs); } )*
+  { return ret; }
+}
+
+List<Type> TypeArguments():
+{
+	List<Type> ret = new LinkedList<Type> ();
+	Type type;
+}
+{
+	"<"
+	type = TypeArgument()
+		{ ret.add (type); }
+	(
+		","
+		type = TypeArgument()
+			{ ret.add(type); }
+	)*
+	">"
+	{ return ret; }
+}
+
+Type TypeArgument():
+{
+	Type ret;
+}
+{
+ (
+   ret = ReferenceType()
+ |
+   ret = Wildcard()
+ )
+ { return ret; }
+}
+
+WildcardType Wildcard():
+{
+	ReferenceType ext = null;
+	ReferenceType sup = null;
+	Location location;
+
+}
+{
+   "?" {location = locationFromToken (token);}
+   [
+		"extends" ext = ReferenceType()
+	|
+		"super" sup = ReferenceType()
+   ]
+   { return new WildcardType(location, ext, sup); }
+}
+
+PrimitiveType PrimitiveType():
+{
+	PrimitiveType ret;
+}
+{
+(
+  "boolean" { ret = new PrimitiveType(locationFromToken (token), PrimitiveType.Primitive.Boolean); }
+|
+  "char" { ret = new PrimitiveType(locationFromToken (token), PrimitiveType.Primitive.Char); }
+|
+  "byte" { ret = new PrimitiveType(locationFromToken (token), PrimitiveType.Primitive.Byte); }
+|
+  "short" { ret = new PrimitiveType(locationFromToken (token), PrimitiveType.Primitive.Short); }
+|
+  "int" { ret = new PrimitiveType(locationFromToken (token), PrimitiveType.Primitive.Int); }
+|
+  "long" { ret = new PrimitiveType(locationFromToken (token), PrimitiveType.Primitive.Long); }
+|
+  "float" { ret = new PrimitiveType(locationFromToken (token), PrimitiveType.Primitive.Float); }
+|
+  "double" { ret = new PrimitiveType(locationFromToken (token), PrimitiveType.Primitive.Double); }
+)
+{ return ret; }
+}
+
+Type ResultType():
+{
+	Type ret;
+}
+{
+  (
+	  "void" { ret = new VoidType(locationFromToken (token)); }
+	|
+	  ret = Type()
+  )
+  { return ret; }
+}
+
+NameExpr Name():
+/*
+ * A lookahead of 2 is required below since "Name" can be followed
+ * by a ".*" when used in the context of an "ImportDeclaration".
+ */
+{
+	NameExpr ret;
+}
+{
+  <IDENTIFIER> { ret = new NameExpr(locationFromToken (token), token.image); }
+  ( LOOKAHEAD(2) "." <IDENTIFIER> { ret = new QualifiedNameExpr(locationFromToken (token), ret, token.image); } )*
+  { return ret; }
+}
+
+List NameList():
+{
+	List ret = new LinkedList();
+	NameExpr name;
+}
+{
+  name = Name() { ret.add(name); }  ( "," name = Name() { ret.add(name); } )*
+
+  { return ret; }
+}
+
+
+/*
+ * Expression syntax follows.
+ */
+
+Expression Expression():
+/*
+ * This expansion has been written this way instead of:
+ *   Assignment() | ConditionalExpression()
+ * for performance reasons.
+ * However, it is a weakening of the grammar for it allows the LHS of
+ * assignments to be any conditional expression whereas it can only be
+ * a primary expression.  Consider adding a semantic predicate to work
+ * around this.
+ */
+{
+	Expression ret;
+	AssignExpr.Operator op;
+	Expression value;
+}
+{
+  ret = ConditionalExpression()
+  [
+    LOOKAHEAD(2)
+    op = AssignmentOperator()
+   	value = Expression() { ret = new AssignExpr(ret.getLocation (), ret, value, op); }
+  ]
+  { return ret; }
+}
+
+AssignExpr.Operator AssignmentOperator():
+{
+	AssignExpr.Operator ret;
+}
+{
+  (
+      "="    { ret = AssignExpr.Operator.assign; }
+    | "*="   { ret = AssignExpr.Operator.star; }
+    | "/="   { ret = AssignExpr.Operator.slash; }
+    | "%="   { ret = AssignExpr.Operator.rem; }
+    | "+="   { ret = AssignExpr.Operator.plus; }
+    | "-="   { ret = AssignExpr.Operator.minus; }
+    | "<<="  { ret = AssignExpr.Operator.lShift; }
+    | ">>="  { ret = AssignExpr.Operator.rSignedShift; }
+    | ">>>=" { ret = AssignExpr.Operator.rUnsignedShift; }
+    | "&="   { ret = AssignExpr.Operator.and; }
+    | "^="   { ret = AssignExpr.Operator.xor; }
+    | "|="   { ret = AssignExpr.Operator.or; }
+  )
+  { return ret; }
+}
+
+Expression ConditionalExpression():
+{
+	Expression ret;
+	Expression left;
+	Expression right;
+}
+{
+  ret = ConditionalOrExpression() [ "?" left = Expression() ":" right = Expression() { ret = new ConditionalExpr(ret.getLocation (), ret, left, right); } ]
+  { return ret; }
+}
+
+Expression ConditionalOrExpression():
+{
+	Expression ret;
+	Expression right;
+}
+{
+  ret = ConditionalAndExpression() ( "||" right = ConditionalAndExpression() { ret = new BinaryExpr(ret.getLocation (), ret, right, BinaryExpr.Operator.or); } )*
+  { return ret; }
+}
+
+Expression ConditionalAndExpression():
+{
+	Expression ret;
+	Expression right;
+}
+{
+  ret = InclusiveOrExpression() ( "&&" right = InclusiveOrExpression() { ret = new BinaryExpr(ret.getLocation (), ret, right, BinaryExpr.Operator.and); } )*
+  { return ret; }
+}
+
+Expression InclusiveOrExpression():
+{
+	Expression ret;
+	Expression right;
+}
+{
+  ret = ExclusiveOrExpression() ( "|" right = ExclusiveOrExpression() { ret = new BinaryExpr(ret.getLocation (), ret, right, BinaryExpr.Operator.binOr); } )*
+  { return ret; }
+}
+
+Expression ExclusiveOrExpression():
+{
+	Expression ret;
+	Expression right;
+}
+{
+  ret = AndExpression() ( "^" right = AndExpression() { ret = new BinaryExpr(ret.getLocation (), ret, right, BinaryExpr.Operator.xor); } )*
+  { return ret; }
+}
+
+Expression AndExpression():
+{
+	Expression ret;
+	Expression right;
+}
+{
+  ret = EqualityExpression() ( "&" right = EqualityExpression() { ret = new BinaryExpr(ret.getLocation (), ret, right, BinaryExpr.Operator.binAnd); } )*
+  { return ret; }
+}
+
+Expression EqualityExpression():
+{
+	Expression ret;
+	Expression right;
+	BinaryExpr.Operator op;
+}
+{
+  ret = InstanceOfExpression()
+  (
+    ( "==" { op = BinaryExpr.Operator.equals; } |
+      "!=" { op = BinaryExpr.Operator.notEquals; }
+    ) right = InstanceOfExpression() { ret = new BinaryExpr(ret.getLocation (), ret, right, op); }
+  )*
+  { return ret; }
+}
+
+Expression InstanceOfExpression():
+{
+	Expression ret;
+	Type type;
+}
+{
+  ret = RelationalExpression() [ "instanceof" type = Type() { ret = new InstanceOfExpr(ret.getLocation (), ret, type); } ]
+  { return ret; }
+}
+
+Expression RelationalExpression():
+{
+	Expression ret;
+	Expression right;
+	BinaryExpr.Operator op;
+}
+{
+  ret = ShiftExpression()
+  (
+  	( "<"  { op = BinaryExpr.Operator.less; } |
+  	  ">"  { op = BinaryExpr.Operator.greater; } |
+  	  "<=" { op = BinaryExpr.Operator.lessEquals; } |
+  	  ">=" { op = BinaryExpr.Operator.greaterEquals; }
+  	) right = ShiftExpression() { ret = new BinaryExpr(ret.getLocation (), ret, right, op); }
+  )*
+  { return ret; }
+}
+
+Expression ShiftExpression():
+{
+	Expression ret;
+	Expression right;
+	BinaryExpr.Operator op;
+}
+{
+  ret = AdditiveExpression()
+  (
+  	( "<<"             { op = BinaryExpr.Operator.lShift; } |
+  	  RSIGNEDSHIFT()   { op = BinaryExpr.Operator.rSignedShift; } |
+  	  RUNSIGNEDSHIFT() { op = BinaryExpr.Operator.rUnsignedShift; }
+  	) right = AdditiveExpression() { ret = new BinaryExpr(ret.getLocation (), ret, right, op); }
+  )*
+  { return ret; }
+}
+
+Expression AdditiveExpression():
+{
+	Expression ret;
+	Expression right;
+	BinaryExpr.Operator op;
+}
+{
+  ret = MultiplicativeExpression()
+  (
+  	( "+" { op = BinaryExpr.Operator.plus; } |
+  	  "-" { op = BinaryExpr.Operator.minus; }
+  	) right = MultiplicativeExpression() { ret = new BinaryExpr(ret.getLocation (), ret, right, op); }
+  )*
+  { return ret; }
+}
+
+Expression MultiplicativeExpression():
+{
+	Expression ret;
+	Expression right;
+	BinaryExpr.Operator op;
+}
+{
+  ret = UnaryExpression()
+  (
+  	( "*" { op = BinaryExpr.Operator.times; } |
+  	  "/" { op = BinaryExpr.Operator.divide; } |
+  	  "%" { op = BinaryExpr.Operator.remainder; }
+  	) right = UnaryExpression() { ret = new BinaryExpr(ret.getLocation (), ret, right, op); }
+  )*
+  { return ret; }
+}
+
+Expression UnaryExpression():
+{
+	Expression ret;
+	UnaryExpr.Operator op;
+	Location location;
+
+}
+{
+  (
+	  ( "+" { op = UnaryExpr.Operator.positive; location = locationFromToken (token);} |
+	    "-" { op = UnaryExpr.Operator.negative; location = locationFromToken (token);}
+	  ) ret = UnaryExpression()
+	  {
+	  	 if(op == UnaryExpr.Operator.negative) {
+	  	 	if (ret instanceof IntegerLiteralExpr && ((IntegerLiteralExpr)ret).isMinValue()) {
+	  	 		ret = new IntegerLiteralMinValueExpr(ret.getLocation ());
+	  	 	} else if (ret instanceof LongLiteralExpr && ((LongLiteralExpr)ret).isMinValue()) {
+	  	 		ret = new LongLiteralMinValueExpr(ret.getLocation ());
+	  	 	} else {
+	  	 		ret = new UnaryExpr(location, ret, op);
+	  	 	}
+	  	 } else {
+	  	 	ret = new UnaryExpr(location, ret, op);
+	  	 }
+	  }
+	|
+	  ret = PreIncrementExpression()
+	|
+	  ret = PreDecrementExpression()
+	|
+	  ret = UnaryExpressionNotPlusMinus()
+  )
+  { return ret; }
+}
+
+Expression PreIncrementExpression():
+{
+	Expression ret;
+	Location location;
+
+}
+{
+  "++" {location = locationFromToken (token);} ret = PrimaryExpression() { ret = new UnaryExpr(location, ret, UnaryExpr.Operator.preIncrement); }
+  { return ret; }
+}
+
+Expression PreDecrementExpression():
+{
+	Expression ret;
+	Location location;
+
+}
+{
+  "--" {location = locationFromToken (token);} ret = PrimaryExpression() { ret = new UnaryExpr(location, ret, UnaryExpr.Operator.preDecrement); }
+  { return ret; }
+}
+
+Expression UnaryExpressionNotPlusMinus():
+{
+	Expression ret;
+	UnaryExpr.Operator op;
+	Location location;
+
+}
+{
+  (
+	  ( "~" { op = UnaryExpr.Operator.inverse; location = locationFromToken (token);} |
+	    "!" { op = UnaryExpr.Operator.not;     location = locationFromToken (token);}
+	  ) ret = UnaryExpression() { ret = new UnaryExpr(location, ret, op); }
+	|
+	  LOOKAHEAD( CastLookahead() )
+	  ret = CastExpression()
+	|
+	  ret = PostfixExpression()
+  )
+  { return ret; }
+}
+
+// This production is to determine lookahead only.  The LOOKAHEAD specifications
+// below are not used, but they are there just to indicate that we know about
+// this.
+void CastLookahead():
+{}
+{
+  LOOKAHEAD(2)
+  "(" PrimitiveType()
+|
+  LOOKAHEAD("(" Type() "[")
+  "(" Type() "[" "]"
+|
+  "(" Type() ")" ( "~" | "!" | "(" | <IDENTIFIER> | "this" | "super" | "new" | Literal() )
+}
+
+Expression PostfixExpression():
+{
+	Expression ret;
+	UnaryExpr.Operator op;
+	Location location;
+
+}
+{
+  ret = PrimaryExpression()
+  [
+  	LOOKAHEAD(2)
+    ( "++" { op = UnaryExpr.Operator.posIncrement; location = locationFromToken (token);} |
+      "--" { op = UnaryExpr.Operator.posDecrement; location = locationFromToken (token);}
+    ) { ret = new UnaryExpr(location, ret, op); }
+  ]
+  { return ret; }
+}
+
+Expression CastExpression():
+{
+	Expression ret;
+	Type type;
+	Location location;
+
+}
+{
+  (
+	  LOOKAHEAD("(" PrimitiveType())
+	  "(" {location = locationFromToken (token);} type = Type() ")" ret = UnaryExpression() { ret = new CastExpr(location, type, ret); }
+	|
+	  "(" {location = locationFromToken (token);} type = Type() ")" ret = UnaryExpressionNotPlusMinus() { ret = new CastExpr(location, type, ret); }
+  )
+  { return ret; }
+}
+
+Expression PrimaryExpression():
+{
+	Expression ret;
+	Expression inner;
+}
+{
+  ret = PrimaryPrefix() ( LOOKAHEAD(2) ret = PrimarySuffix(ret) )*
+  { return ret; }
+}
+
+Expression PrimaryPrefix():
+{
+	Expression ret;
+	String name;
+	List args = null;
+	boolean hasArgs = false;
+	Type type;
+	Location location;
+
+}
+{
+  (
+	  ret = Literal()
+	|
+	  "this" { ret = new ThisExpr(locationFromToken (token), null); }
+	|
+	  "super" args=Arguments()
+	  	{
+   			Expression scope = new SuperExpr (locationFromToken (token), null);
+   			ret = new MethodCallExpr (locationFromToken (token), scope, null, null, args);
+   		}
+	|
+	  "(" {location = locationFromToken (token);} ret = Expression() ")" { ret = new EnclosedExpr(location, ret); }
+	|
+	  ret = AllocationExpression(null)
+	|
+  	  ret = AnyTaintEpxr()
+	|
+	  LOOKAHEAD( ResultType() "." "class" )
+	  type = ResultType() "." "class" { ret = new ClassExpr(type.getLocation (), type); }
+	|
+	  	<IDENTIFIER> { name = token.image; location = locationFromToken (token); } [ args = Arguments() {hasArgs=true;} ]
+	  	{
+	  		ret = hasArgs
+	  			? new MethodCallExpr(location, null, null, name, args)
+	  			: new NameExpr(location, name);
+	  	}
+  )
+  { return ret; }
+}
+
+Expression PrimarySuffix(Expression scope):
+{
+	Expression ret;
+	List<Type> types = null;
+	List args = null;
+	boolean hasArgs = false;
+	String name;
+	Location	location = null;
+}
+{
+  (
+  	"."
+  	(
+		"this" { ret = new ThisExpr(locationFromToken (token), scope); }
+	  |
+	  	"super" { ret = new SuperExpr(locationFromToken (token), scope); }
+	  |
+	  	ret = AllocationExpression(scope)
+	  |
+	  	[
+	  		types = TypeArguments()
+	  			{ location = types.get (0).getLocation (); }
+	  	]
+	  	<IDENTIFIER>
+	  		{
+	  			name = token.image;
+	  			if (location == null) location = locationFromToken (token);
+	  		}
+
+	  	[ args = Arguments() {hasArgs=true;} ]
+	  	{
+	  		ret = hasArgs
+	  			? new MethodCallExpr  (location, scope, types, name, args)
+	  			: new FieldAccessExpr (location, scope, types, name);
+	  	}
+	)
+	|
+	  "[" {location = locationFromToken (token);}
+	  ret = Expression()
+	  "]"
+	  { ret = new ArrayAccessExpr(location, scope, ret); }
+  )
+  { return ret; }
+}
+
+Expression Literal():
+{
+	Expression ret;
+}
+{
+  (
+	  <INTEGER_LITERAL> {
+	  		ret = new IntegerLiteralExpr(locationFromToken (token), token.image);
+	  }
+	|
+	  <LONG_LITERAL> {
+	  		ret = new LongLiteralExpr(locationFromToken (token), token.image);
+	  }
+	|
+	  <FLOATING_POINT_LITERAL> {
+	  		ret = new DoubleLiteralExpr(locationFromToken (token), token.image);
+	  }
+	|
+	  <CHARACTER_LITERAL> {
+	  	ret = new CharLiteralExpr(locationFromToken (token), token.image.substring(1, token.image.length()-1));
+	  }
+	|
+	  <STRING_LITERAL> {
+	  	ret = new StringLiteralExpr(locationFromToken (token), token.image.substring(1, token.image.length()-1));
+	  }
+	|
+	  ret = BooleanLiteral()
+	|
+	  ret = NullLiteral()
+  )
+  { return ret; }
+}
+
+Expression BooleanLiteral():
+{
+	Expression ret;
+}
+{
+  (
+	  "true" { ret = new BooleanLiteralExpr(locationFromToken (token), Boolean.TRUE); }
+	|
+	  "false" { ret = new BooleanLiteralExpr(locationFromToken (token), Boolean.FALSE); }
+  )
+  { return ret; }
+}
+
+Expression NullLiteral():
+{}
+{
+  "null"
+  { return new NullLiteralExpr(locationFromToken (token)); }
+}
+
+List Arguments():
+{
+	List ret = null;
+}
+{
+  "(" [ ret = ArgumentList() ] ")"
+  { return ret; }
+}
+
+List ArgumentList():
+{
+	List ret = new LinkedList();
+	Expression expr;
+}
+{
+  expr = Expression() { ret.add(expr); } ( "," expr = Expression() { ret.add(expr); } )*
+  { return ret; }
+}
+
+Expression AllocationExpression(Expression scope):
+{
+	Expression ret;
+	Type type;
+	Object[] arr = null;
+	List typeArgs = null;
+	List anonymousBody = null;
+	List args;
+	Location location;
+
+}
+{
+  (
+	  LOOKAHEAD(2)
+	  "new" {location = locationFromToken (token);} type = PrimitiveType() arr = ArrayDimsAndInits()
+	  {
+	  	if (arr[0] instanceof Integer) {
+		  	ret = new ArrayCreationExpr(location, type, null, ((Integer)arr[0]).intValue(), (ArrayInitializerExpr)arr[1]);
+	  	} else {
+		  	ret = new ArrayCreationExpr(location, type, null, (List)arr[0], ((Integer)arr[1]).intValue());
+	  	}
+	  }
+	|
+	  "new" {location = locationFromToken (token);} type = ClassOrInterfaceType() [ typeArgs = TypeArguments() ]
+	    (
+	      arr = ArrayDimsAndInits()
+		  {
+		  	if (arr[0] instanceof Integer) {
+			  	ret = new ArrayCreationExpr(location, type, typeArgs, ((Integer)arr[0]).intValue(), (ArrayInitializerExpr)arr[1]);
+		  	} else {
+			  	ret = new ArrayCreationExpr(location, type, typeArgs, (List)arr[0], ((Integer)arr[1]).intValue());
+		  	}
+		  }
+	    |
+	      args = Arguments() [ LOOKAHEAD(2) anonymousBody = ClassOrInterfaceBody(false) ]
+	      { ret = new ObjectCreationExpr(location, scope, (ClassOrInterfaceType) type, typeArgs, args, anonymousBody); }
+	    )
+  )
+  { return ret; }
+}
+
+/*
+ * The third LOOKAHEAD specification below is to parse to PrimarySuffix
+ * if there is an expression between the "[...]".
+ */
+Object[] ArrayDimsAndInits():
+{
+	Object[] ret = new Object[2];
+	Expression expr;
+	List inits = null;
+	int i = 0;
+}
+{
+  (
+	  LOOKAHEAD(2)
+	  ( LOOKAHEAD(2) "[" expr = Expression() { inits = add(inits, expr); } "]" )+ ( LOOKAHEAD(2) "[" "]" { i++; } )* { ret[0] = inits; ret[1] = new Integer(i); }
+	|
+	  ( "[" "]" { i++; } )+ expr = ArrayInitializer() { ret[0] = new Integer(i); ret[1] = expr; }
+  )
+  { return ret; }
+}
+
+
+/*
+ * Statement syntax follows.
+ */
+
+Statement Statement():
+{
+	Statement ret;
+}
+{
+  (
+	  LOOKAHEAD(2)
+	  ret = LabeledStatement()
+	|
+	  ret = AssertStatement()
+	|
+      ret = ExplicitConstructorInvocation()
+	|
+	  ret = Block()
+	|
+	  ret = EmptyStatement()
+	|
+	  ret = StatementExpression()
+	|
+	  ret = SwitchStatement()
+	|
+	  ret = IfStatement()
+	|
+	  ret = WhileStatement()
+	|
+	  ret = DoStatement()
+	|
+	  ret = ForStatement()
+	|
+	  ret = BreakStatement()
+	|
+	  ret = ContinueStatement()
+	|
+	  ret = ReturnStatement()
+	|
+	  ret = ThrowStatement()
+	|
+	  ret = SynchronizedStatement()
+	|
+	  ret = TryStatement()
+	|
+	  ret = PolymerActionSwitchStatement()
+  )
+  { return ret; }
+}
+
+AssertStmt AssertStatement():
+{
+	Expression check;
+	Expression msg = null;
+	Location location;
+
+}
+{
+  "assert" {location = locationFromToken (token);} check = Expression() [ ":" msg = Expression() ] ";"
+  { return new AssertStmt(location, check, msg);  }
+}
+
+LabeledStmt LabeledStatement():
+{
+	String label;
+	Statement stmt;
+	Location location;
+
+}
+{
+  <IDENTIFIER> {location = locationFromToken (token);} { label = token.image; } ":" stmt = Statement()
+  { return new LabeledStmt(location, label, stmt); }
+}
+
+BlockStmt Block():
+{
+	List<Statement> stmts;
+	Location		location;
+}
+{
+	"{"  {location = locationFromToken (token);}
+	stmts = Statements()
+	"}"
+
+  	{ return new BlockStmt (location, stmts); }
+}
+
+/*
+ * Classes inside block stametents can only be abstract or final. The semantic must check it.
+ */
+Statement BlockStatement():
+{
+	Statement ret;
+	Expression expr;
+	ClassOrInterfaceDeclaration typeDecl;
+	Modifier modifier;
+}
+{
+  (
+	  LOOKAHEAD( Modifiers() ("class" | "interface") )
+	  modifier = Modifiers()
+	  typeDecl = ClassOrInterfaceDeclaration(modifier) { ret = new TypeDeclarationStmt(typeDecl.getLocation (), typeDecl); }
+	|
+  	  LOOKAHEAD(VariableDeclarationExpression() )
+	  expr = VariableDeclarationExpression() { ret = new ExpressionStmt(expr.getLocation (), expr); } ";"
+    |
+	  ret = Statement()
+  )
+  { return ret; }
+}
+
+VariableDeclarationExpr VariableDeclarationExpression():
+{
+	Modifier modifier;
+	Type type;
+	List vars = new LinkedList();
+	VariableDeclarator var;
+}
+{
+  modifier = Modifiers() type = Type() var = VariableDeclarator() { vars.add(var); } ( "," var = VariableDeclarator() { vars.add(var); } )*
+  { return new VariableDeclarationExpr(type.getLocation (), modifier.modifiers, modifier.annotations, type, vars); }
+}
+
+EmptyStmt EmptyStatement():
+{}
+{
+  ";"
+  { return new EmptyStmt(locationFromToken (token)); }
+}
+
+ExpressionStmt StatementExpression():
+/*
+ * The last expansion of this production accepts more than the legal
+ * Java expansions for StatementExpression.  This expansion does not
+ * use PostfixExpression for performance reasons.
+ */
+{
+	Expression expr;
+	AssignExpr.Operator op;
+	Expression value;
+}
+{
+  (
+	  expr = PreIncrementExpression()
+	|
+	  expr = PreDecrementExpression()
+	|
+	  expr = PrimaryExpression()
+	  [
+	    "++" { expr = new UnaryExpr(expr.getLocation (), expr, UnaryExpr.Operator.posIncrement);  }
+	  |
+	    "--" { expr = new UnaryExpr(expr.getLocation (), expr, UnaryExpr.Operator.posDecrement);  }
+	  |
+	    op = AssignmentOperator() value = Expression() { expr = new AssignExpr(expr.getLocation (), expr, value, op); }
+	  ]
+  )
+  ";"
+  { return new ExpressionStmt(expr.getLocation (), expr); }
+}
+
+SwitchStmt SwitchStatement():
+{
+	Expression selector;
+	SwitchEntryStmt entry;
+	List entries = null;
+	Location location;
+
+}
+{
+  "switch" {location = locationFromToken (token);} "(" selector = Expression() ")" "{"
+    ( entry = SwitchEntry() { entries = add(entries, entry); } )*
+  "}"
+
+  { return new SwitchStmt(location, selector, entries); }
+}
+
+SwitchEntryStmt SwitchEntry():
+{
+	Expression label = null;
+	List stmts;
+	Location location;
+
+}
+{
+  (
+	  "case" {location = locationFromToken (token);} label = Expression()
+	|
+	  "default" {location = locationFromToken (token);}
+  )
+  ":" stmts = Statements()
+
+  { return new SwitchEntryStmt(location, label, stmts); }
+}
+
+IfStmt IfStatement():
+/*
+ * The disambiguating algorithm of JavaCC automatically binds dangling
+ * else's to the innermost if statement.  The LOOKAHEAD specification
+ * is to tell JavaCC that we know what we are doing.
+ */
+{
+	Expression condition;
+	Statement thenStmt;
+	Statement elseStmt = null;
+	Location location;
+
+}
+{
+  "if" {location = locationFromToken (token);} "(" condition = Expression() ")" thenStmt = Statement() [ LOOKAHEAD(1) "else" elseStmt = Statement() ]
+  { return new IfStmt(location, condition, thenStmt, elseStmt); }
+}
+
+WhileStmt WhileStatement():
+{
+	Expression condition;
+	Statement body;
+	Location location;
+
+}
+{
+  "while" {location = locationFromToken (token);} "(" condition = Expression() ")" body = Statement()
+  { return new WhileStmt(location, condition, body); }
+}
+
+DoStmt DoStatement():
+{
+	Expression condition;
+	Statement body;
+	Location location;
+
+}
+{
+  "do" {location = locationFromToken (token);} body = Statement() "while" "(" condition = Expression() ")" ";"
+  { return new DoStmt(location, body, condition); }
+}
+
+Statement ForStatement():
+{
+	String id = null;
+	VariableDeclarationExpr varExpr = null;
+	Expression expr = null;
+	List init = null;
+	List update = null;
+	Statement body;
+	Location location;
+
+}
+{
+  "for" {location = locationFromToken (token);} "("
+
+  (
+      LOOKAHEAD(VariableDeclarationExpression() ":")
+      varExpr = VariableDeclarationExpression() ":" expr = Expression()
+    |
+     [ init = ForInit() ] ";" [ expr = Expression() ] ";" [ update = ForUpdate() ]
+  )
+
+  ")" body = Statement()
+
+  {
+  	if (varExpr != null) {
+  		return new ForeachStmt(location, varExpr, expr, body);
+  	}
+	return new ForStmt(location, init, expr, update, body);
+  }
+}
+
+List ForInit():
+{
+	List ret;
+	Expression expr;
+}
+{
+  (
+	  LOOKAHEAD( Modifiers() Type() <IDENTIFIER> )
+	  expr = VariableDeclarationExpression() { ret = new LinkedList(); ret.add(expr); }
+	|
+	  ret = ExpressionList()
+  )
+  { return ret; }
+}
+
+List ExpressionList():
+{
+	List ret = new LinkedList();
+	Expression expr;
+}
+{
+  expr = Expression() { ret.add(expr); } ( "," expr = Expression()  { ret.add(expr); } )*
+
+  { return ret; }
+}
+
+List ForUpdate():
+{
+	List ret;
+}
+{
+  ret = ExpressionList()
+
+  { return ret; }
+}
+
+BreakStmt BreakStatement():
+{
+	String id = null;
+	Location location;
+
+}
+{
+  "break" {location = locationFromToken (token);} [ <IDENTIFIER> { id = token.image; } ] ";"
+  { return new BreakStmt(location, id); }
+}
+
+ContinueStmt ContinueStatement():
+{
+	String id = null;
+	Location location;
+
+}
+{
+  "continue" {location = locationFromToken (token);} [ <IDENTIFIER> { id = token.image; } ] ";"
+  { return new ContinueStmt(location, id); }
+}
+
+ReturnStmt ReturnStatement():
+{
+	Expression expr = null;
+	Location location;
+
+}
+{
+  "return" {location = locationFromToken (token);} [ expr = Expression() ] ";"
+  { return new ReturnStmt(location, expr); }
+}
+
+ThrowStmt ThrowStatement():
+{
+	Expression expr;
+	Location location;
+
+}
+{
+  "throw" {location = locationFromToken (token);} expr = Expression() ";"
+  { return new ThrowStmt(location, expr); }
+}
+
+SynchronizedStmt SynchronizedStatement():
+{
+	Expression expr;
+	BlockStmt block;
+	Location location;
+
+}
+{
+  "synchronized" {location = locationFromToken (token);} "(" expr = Expression() ")" block = Block()
+  { return new SynchronizedStmt(location, expr, block); }
+}
+
+TryStmt TryStatement():
+/*
+ * Semantic check required here to make sure that at least one
+ * finally/catch is present.
+ */
+{
+	BlockStmt tryBlock;
+	BlockStmt finallyBlock = null;
+	List catchs = null;
+	Parameter except;
+	BlockStmt catchBlock;
+	Location location;
+	Location catchLocation;
+}
+{
+	"try" {location = locationFromToken (token);}
+	tryBlock = Block()
+
+	(
+		"catch"
+			{catchLocation = locationFromToken (token);}
+		"("
+		except = FormalParameter()
+		")"
+		catchBlock = Block()
+			{ catchs = add (catchs, new CatchClause (catchLocation, except, catchBlock)); }
+	)*
+
+	[
+		"finally"
+		finallyBlock = Block()
+	]
+	{ return new TryStmt (location, tryBlock, catchs, finallyBlock); }
+}
+
+/* We use productions to match >>>, >> and > so that we can keep the
+ * type declaration syntax with generics clean
+ */
+
+void RUNSIGNEDSHIFT():
+{}
+{
+  ( LOOKAHEAD({ getToken(1).kind == GT &&
+                ((Token.GTToken)getToken(1)).realKind == RUNSIGNEDSHIFT} )
+   ">" ">" ">"
+  )
+}
+
+void RSIGNEDSHIFT():
+{}
+{
+  ( LOOKAHEAD({ getToken(1).kind == GT &&
+                ((Token.GTToken)getToken(1)).realKind == RSIGNEDSHIFT} )
+  ">" ">"
+  )
+}
+
+/* Annotation syntax follows. */
+
+AnnotationExpr Annotation():
+{
+	AnnotationExpr ret;
+}
+{
+  (
+	   LOOKAHEAD( "@" Name() "(" ( <IDENTIFIER> "=" | ")" ))
+	   ret = NormalAnnotation()
+	 |
+	   LOOKAHEAD( "@" Name() "(" )
+	   ret = SingleMemberAnnotation()
+	 |
+	   ret = MarkerAnnotation()
+  )
+  { return ret; }
+}
+
+NormalAnnotationExpr NormalAnnotation():
+{
+	NameExpr name;
+	List pairs = null;
+	Location location;
+
+}
+{
+   "@" {location = locationFromToken (token);} name = Name() "(" [ pairs = MemberValuePairs() ] ")"
+   { return new NormalAnnotationExpr(location, name, pairs); }
+}
+
+MarkerAnnotationExpr MarkerAnnotation():
+{
+	NameExpr name;
+	Location location;
+
+}
+{
+  "@" {location = locationFromToken (token);} name = Name()
+  { return new MarkerAnnotationExpr(location, name); }
+}
+
+SingleMemberAnnotationExpr SingleMemberAnnotation():
+{
+	NameExpr name;
+	Expression memberVal;
+	Location location;
+
+}
+{
+  "@" {location = locationFromToken (token);} name = Name() "(" memberVal = MemberValue() ")"
+  { return new SingleMemberAnnotationExpr(location, name, memberVal); }
+}
+
+List MemberValuePairs():
+{
+	List ret = new LinkedList();
+	MemberValuePair pair;
+}
+{
+   pair = MemberValuePair() { ret.add(pair); } ( "," pair = MemberValuePair() { ret.add(pair); } )*
+   { return ret; }
+}
+
+MemberValuePair MemberValuePair():
+{
+	String name;
+	Expression value;
+	Location location;
+
+}
+{
+    <IDENTIFIER> { name = token.image; location = locationFromToken (token);} "=" value = MemberValue()
+    { return new MemberValuePair(location, name, value); }
+}
+
+Expression MemberValue():
+{
+	Expression ret;
+}
+{
+  (
+	   ret = Annotation()
+	 |
+	   ret = MemberValueArrayInitializer()
+	 |
+	   ret = ConditionalExpression()
+  )
+  { return ret; }
+}
+
+Expression  MemberValueArrayInitializer():
+{
+	List ret = new LinkedList();
+	Expression member;
+	Location location;
+
+}
+{
+  "{" {location = locationFromToken (token);} member = MemberValue() { ret.add(member); } ( LOOKAHEAD(2) "," member = MemberValue() { ret.add(member); } )* [ "," ] "}"
+  { return new ArrayInitializerExpr(location, ret); }
+}
+
+
+/* Annotation Types. */
+
+AnnotationDeclaration AnnotationTypeDeclaration(Modifier modifier):
+{
+	String name;
+	List members;
+	Location location;
+
+}
+{
+  "@" {location = locationFromToken (token);} "interface" <IDENTIFIER> { name = token.image; } members = AnnotationTypeBody()
+
+  { return new AnnotationDeclaration(location, modifier.modifiers, modifier.annotations, name, members); }
+}
+
+List AnnotationTypeBody():
+{
+	List ret = null;
+	BodyDeclaration member;
+}
+{
+  "{" ( member = AnnotationBodyDeclaration() { ret = add(ret, member); } )* "}"
+
+  { return ret; }
+}
+
+BodyDeclaration AnnotationBodyDeclaration():
+{
+   Modifier modifier;
+   BodyDeclaration ret;
+}
+{
+  modifier = Modifiers()
+  (
+    (
+	   LOOKAHEAD(Type() <IDENTIFIER> "(")
+	   ret = AnnotationTypeMemberDeclaration(modifier)
+	  |
+	   ret = ClassOrInterfaceDeclaration(modifier)
+	  |
+	   ret = EnumDeclaration(modifier)
+	  |
+	   ret = AnnotationTypeDeclaration(modifier)
+	  |
+	   ret = FieldDeclaration(modifier)
+	 )
+	 |
+	   ";" { ret = new EmptyTypeDeclaration(locationFromToken (token)); }
+  )
+  { return ret; }
+}
+
+AnnotationMemberDeclaration AnnotationTypeMemberDeclaration(Modifier modifier):
+{
+	Type type;
+	String name;
+	Expression defaultVal = null;
+}
+{
+	type = Type() <IDENTIFIER> { name = token.image; } "(" ")" [ defaultVal = DefaultValue() ] ";"
+
+	{ return new AnnotationMemberDeclaration(type.getLocation (), modifier.modifiers, modifier.annotations, type, name, defaultVal); }
+}
+
+Expression DefaultValue():
+{
+	Expression ret;
+}
+{
+  "default" ret = MemberValue()
+  { return ret; }
+}
+
+/**********************************************************************************************************************/
+/* Polymer additions */
+/**********************************************************************************************************************/
+
+PolymerActionSwitchStmt PolymerActionSwitchStatement():
+{
+	Expression 						selector;
+	PolymerActionSwitchEntryStmt 	entry;
+	List 							entries = null;
+	Location						location;
+}
+{
+	"aswitch" 	{location = locationFromToken (token);}
+  	"(" selector = Expression() ")"
+  	"{"
+    	( entry = PolymerActionSwitchEntry() { entries = add(entries, entry); } )*
+  	"}"
+
+  { return new PolymerActionSwitchStmt(location, selector, entries); }
+}
+
+PolymerActionSwitchEntryStmt PolymerActionSwitchEntry():
+{
+	List 				stmts;
+	Location			location;
+	ActionPatternExpr	pat;
+}
+{
+  	"case" 			{location = locationFromToken (token);}
+  	(
+  		pat=ActionPattern()
+  		|
+  		"done"		{pat = new ActionPatternExpr (locationFromToken (token), new ActionPatternDone ());}
+  	)
+  	":" stmts = Statements()
+
+  	{
+  		return new PolymerActionSwitchEntryStmt (location, pat, stmts);
+  	}
+}
+
+ActionPatternExpr ActionPattern():
+{
+	Location			location;
+	ActionPattern		pattern;
+	TaintPatternExpr	contextTaint;
+}
+{
+	"<"	{location = locationFromToken (token);}
+
+	{
+		pattern = new ActionPattern ();
+	}
+
+	( APModifier (pattern) )*
+
+
+	APReturnType(pattern)
+	APMethod(pattern)
+	"(" [ APFormalParameters(pattern) ] ")"
+
+	[
+		contextTaint=TaintPatternExpr()
+			{pattern.setContextTaint (contextTaint.taintPattern);}
+	]
+
+	">"
+
+	{
+		return new ActionPatternExpr (location, pattern);
+	}
+}
+
+void APModifier(ActionPattern pattern):
+{
+}
+{
+	/* TODO: error on duplicate, incompatible */
+	(
+		"final"				{pattern.setFinal (true);}
+	|
+		"abstract"			{pattern.setAbstractAction (true);}
+	)
+}
+
+void APReturnType(ActionPattern pattern):
+{
+	Type type;
+}
+{
+	(
+		"*"			{pattern.setReturnType (null);}
+	|
+		type=Type()	{pattern.setReturnType (type);}
+	|
+		"void"		{pattern.setReturnType (new VoidType (locationFromToken (token)));}
+	)
+}
+
+void APMethod(ActionPattern pattern):
+{
+	boolean 			isSpecial	= false;
+	TaintPatternExpr 	thisTaint 	= null;
+	List<String>		parts		= new LinkedList<String> ();
+	Token				errToken;
+}
+{
+	(
+		errToken=<IDENTIFIER>	{parts.add (token.image);}
+	|
+		errToken="*" 			{parts.add (null);}
+	)
+	(LOOKAHEAD(3)
+		"."
+		(
+			<IDENTIFIER>	{parts.add (token.image);}
+		|
+			"*" 			{parts.add (null);}
+		)
+	)+
+
+		[
+			"."
+			"<"
+			<IDENTIFIER>
+				{
+					parts.add ("<" + token.image + ">");
+					isSpecial = true;
+				}
+			">"
+			|
+			thisTaint=TaintPatternExpr()
+			"."
+			<IDENTIFIER> {parts.add (token.image);}
+		]
+
+	{
+		if (parts.size () < 3)
+			throw new ParseException (errToken, "Missing method name in action pattern");
+
+		String 	className 		= parts.get (parts.size () - 2);
+		String 	methodName 		= parts.get (parts.size () - 1);
+		String 	packageName 	= "";
+		int 	packageCount	= parts.size () - 2;
+		if (packageCount == 1 && parts.get (0) == null)
+		{
+			packageName = null;
+		}
+		else
+		{
+			for (int i = 0; i < packageCount; i++)
+			{
+				if (packageName.length () != 0)
+					packageName += ".";
+				if (parts.get (i) == null)
+				{
+					throw new ParseException (errToken, "Only one * allowed in package pattern");
+				}
+				packageName += parts.get (i);
+			}
+		}
+
+		pattern.setMethod (packageName, className, methodName, thisTaint == null ? null : thisTaint.taintPattern);
+	}
+}
+
+void APFormalParameters(ActionPattern pattern):
+{
+}
+{
+	APFormalParameter(pattern) ( "," APFormalParameter(pattern) )*
+}
+
+void APFormalParameter(ActionPattern pattern):
+{
+	TaintPatternExpr 	taintExpr 	= null;
+	TaintPattern		taint		= null;
+	boolean 			isAny 		= false;
+	Token				paramName 	= null;
+	Type 				type 		= null;
+}
+{
+	(
+		".."	{isAny = true;}
+	|
+		"*"		{isAny = false;}
+	|
+		( type=Type() [ paramName=<IDENTIFIER> ] )
+	)
+
+	[ taintExpr=TaintPatternExpr() {taint = taintExpr.taintPattern;}]
+
+		{
+			if (isAny)
+				pattern.allowAnyFormalParameter (taint);
+			else
+				pattern.addFormalParameter (new ActionPattern.FormalParameter (type,
+														paramName == null ? null : paramName.image, taint));
+		}
+}
+
+TaintExpr TaintExpr():
+{
+	Token first;
+	Taint taint;
+}
+{
+	first="#"
+
+	taint=TaintBody()
+		{return new TaintExpr (locationFromToken (first), taint);}
+}
+
+
+Taint TaintBody():
+{
+	int	taintType = Taint.TAINT_AUTO;
+	Taint taint;
+}
+{
+	<IDENTIFIER>
+		{
+				 if (token.image.equals ("auto")) 		taintType = Taint.TAINT_AUTO;
+			else if (token.image.equals ("object")) 	taintType = Taint.TAINT_OBJECT;
+			else if (token.image.equals ("primitive"))	taintType = Taint.TAINT_PRIMITIVE;
+			else throw new ParseException (token, "Invalid taint type");
+		}
+	":"
+
+	taint=TaintWithoutType(taintType)
+		{return taint;}
+}
+
+Taint TaintWithoutType (int taintType):
+{
+	HashSet<String>	taintNames;
+}
+{
+	(
+		"*"					{return new Taint (taintType,  Taint.MAX_TAINT);}
+		|
+		<INTEGER_LITERAL>	{return new Taint (taintType,  parseInt (token.image));}
+		|
+		"{"					{taintNames = new HashSet<String> ();}
+			<IDENTIFIER>
+				{
+					if (taintNames.contains (token.image))
+						throw new ParseException (token, "Duplicate taint value " + token.image);
+					taintNames.add (token.image);
+				}
+
+			(
+				","
+				<IDENTIFIER>
+					{
+						if (taintNames.contains (token.image))
+							throw new ParseException (token, "Duplicate taint value " + token.image);
+						taintNames.add (token.image);
+					}
+			)*
+		"}"
+							{return new NamedTaint (taintType, taintNames);}
+	)
+}
+
+TaintPatternExpr TaintPatternExpr():
+{
+	Token	first;
+	Taint 	taint 		= null;
+	Token	taintName	= null;
+	boolean matchAll 	= false;
+	Token	saveName	= null;
+}
+{
+	first="#"
+
+	"<"
+
+
+	(
+		taint=TaintWithoutType(Taint.TAINT_AUTO)
+		|
+		taintName=<IDENTIFIER>
+	)
+
+	[
+		<BIT_OR>	{matchAll = false;}
+		|
+		<BIT_AND> 	{matchAll = true;}
+	]
+
+	[
+		saveName=<IDENTIFIER>
+	]
+
+	">"
+
+	{
+		TaintPattern pattern;
+		String realSaveName = saveName == null ? null : saveName.image;
+		if (taintName != null)
+		{
+			pattern = new TaintPattern (taintName.image, matchAll, realSaveName);
+		}
+		else
+		{
+			pattern = new TaintPattern (taint, matchAll, realSaveName);
+		}
+		return new TaintPatternExpr (locationFromToken (first), pattern);
+	}
+}
+
+Expression AnyTaintEpxr():
+{
+	Expression expr;
+}
+{
+	(
+		LOOKAHEAD(2)
+		expr=TaintLiteralExpr()
+		|
+		LOOKAHEAD(2)
+		expr=TaintExpr()
+		|
+		expr=TaintPatternExpr()
+	)
+		{return expr;}
+}
+
+EngineTaintDeclaration EngineTaintDeclaration(Modifier modifier):
+{
+	Location 								location;
+	String 									name;
+	ClassOrInterfaceType					extend = null;
+	EngineTaintConstantDeclaration			entry;
+	List<EngineTaintConstantDeclaration> 	entries = new LinkedList<EngineTaintConstantDeclaration> ();
+
+}
+{
+	"enginetaint"
+		{location = locationFromToken (token);}
+
+  	<IDENTIFIER>
+  		{ name = token.image; }
+
+  	[ extend = Extends(false) ]
+
+  	"{"
+    	entry = EngineTaintConstant()
+    		{ entries.add(entry); }
+
+    	(
+    		","
+
+    		entry = EngineTaintConstant()
+    			{ entries.add(entry); }
+    	)*
+  	"}"
+
+  	{
+  		EngineTaintDeclaration decl = new EngineTaintDeclaration (location, modifier.modifiers,
+  																  modifier.annotations, name, extend, entries);
+		engineTaints.add (decl);
+		return decl;
+  	}
+}
+
+
+EngineTaintConstantDeclaration EngineTaintConstant():
+{
+}
+{
+  	<IDENTIFIER>
+  		{return new EngineTaintConstantDeclaration (locationFromToken (token), token.image);}
+}
+
+TaintLiteralExpr TaintLiteralExpr():
+{
+	Token			 first;
+	HashSet<String>	 values;
+}
+{
+	first="#"
+
+	values=TaintLiteralBody()
+		{return new TaintLiteralExpr (locationFromToken (first), values);}
+}
+
+
+HashSet<String> TaintLiteralBody():
+{
+	HashSet<String> values = new HashSet<String> ();
+}
+{
+	"{"
+
+	[
+		<IDENTIFIER>
+			{
+				if (values.contains (token.image))
+					throw new ParseException (token, "Duplicate value " + token.image);
+				values.add (token.image);
+			}
+
+		(
+			","
+			<IDENTIFIER>
+				{
+					if (values.contains (token.image))
+						throw new ParseException (token, "Duplicate value " + token.image);
+					values.add (token.image);
+				}
+		)*
+	]
+
+	"}"
+		{return values;}
+}

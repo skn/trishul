@@ -1,0 +1,20 @@
+package trishul.test.trishul_p;
+import trishul_p.*;
+
+public class ParamValue
+extends Engine
+{
+  	public Order query (Action a)
+  	{
+    	aswitch(a)
+    	{
+      	case <* *.TestGeneric.testParams(int p1, String p2)>:
+	      		System.out.print ("INT: " + p1 + " - " + p2 + "\n");
+	      		break;
+      	case <* *.TestGeneric.doubleParams(long p2, double p1)>:
+	      		System.out.print ("2: " + Long.toHexString (Double.doubleToRawLongBits (p1)) + " - " + Long.toHexString (p2) + "\n");
+	      		break;
+    	}
+    	return null;
+  	}
+}

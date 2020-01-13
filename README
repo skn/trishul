@@ -1,0 +1,41 @@
+Trishul is an system primarily designed to help enforce policies 
+associated with data/information. At the core of the architecture 
+is a Java Virtual Machine (JVM) implementation that supports information 
+flow control.
+
+This work was done as part of Ph.D. work of Srijith Nair (https://srijith.net)
+at Vrije Universiteit, Amsterdam. Patrick Simpson developed a lot of the 
+code for Trishul. More details can be found at https://srijith.net/vu/trishul/
+
+The code contained here is based off v1.1.7 of the Kaffee JVM and 
+was released on 6th Nov 2008.
+
+If you are face any difficulty in compiling and installing Trishul, 
+an Ubuntu 6.10 VM is available as virtual appliance for ease of use. 
+Please email me for more information.
+
+[1] Srijith K. Nair, Gabriela Gheorghe, Bruno Crispo and Andrew S. Tanenbaum, 
+"Enforcing DRM Policies Across Applications", 8th ACM DRM Workshop (DRM 2008), 
+Co-located with ACM CCS 2008, pp. 87-94, October 27, 2008, Alexandria, Virginia, 
+USA.
+
+[2] Srijith K. Nair, Patrick N.D. Simpson, Bruno Crispo and Andrew S. Tanenbaum, 
+Trishul: A Policy Enforcement Architecture for Java Virtual Machines
+Technical Report IR-CS-045, Department of Computer Science, Vrije Universiteit, May 2008.
+
+[3] Srijith K. Nair, Patrick N.D. Simpson, Bruno Crispo and Andrew S. Tanenbaum,
+"A Virtual Machine Based Information Flow Control System for Policy Enforcement"
+Electronic Notes in Theoretical Computer Science, Vol. 197, Issue 1, 21 February 2008, 
+pp. 3-16, Proc. of the First International Workshop on Run Time Enforcement for Mobile 
+and Distributed Systems (REM 2007), Sep 27, 2007, Dresden, Germany. 
+(doi:10.1016/j.entcs.2007.10.010), 
+
+[4] Srijith K. Nair, Patrick N.D. Simpson, Bruno Crispo and Andrew S. Tanenbaum, 
+"Design and Implementation of a Virtual Machine Based Information Flow Control System"
+Technical Report IR-CS-040, Department of Computer Science, Vrije Universiteit, May 2007.
+
+[5] Srijith K. Nair, Bruno Crispo, Andrew S. Tanenbaum, 
+"Towards a Secure Application-semantic Aware Policy Enforcement Architecture", 
+Proceedings of the 14th International Workshop on Security Protocols 2006, Cambridge, UK,
+ pages 26-31. Springer-Verlag LNCS 5087, 2009. (B. Christianson, B. Crispo, J.A. Malcolm, 
+and M. Roe, editors)  

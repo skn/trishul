@@ -1,0 +1,15 @@
+package trishul.test.trishul_p;
+import trishul_p.*;
+
+/** disallows printlns
+ */
+public class PrintlnSupEngine extends Engine {
+  public Order query(Action a) {
+    aswitch(a) {
+      case <* *.*.println(..)>: return new SuppressOrder();
+    }
+    return null;
+  }
+
+
+}

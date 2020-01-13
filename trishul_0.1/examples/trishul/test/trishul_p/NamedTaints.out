@@ -1,0 +1,7 @@
+TAINT: 11
+1 OK
+666
+NOT ALLOWED
+Orignal string
+TAINT: 11
+TAINT: 11

@@ -1,0 +1,17 @@
+package trishul.test.trishul_p;
+import trishul_p.*;
+
+public class TestDoneAction
+extends Engine
+{
+  	public Order query (Action a)
+  	{
+    	aswitch(a)
+    	{
+      	case done:
+      		System.out.print ("DONE\n");
+      		break;
+    	}
+    	return null;
+  	}
+}

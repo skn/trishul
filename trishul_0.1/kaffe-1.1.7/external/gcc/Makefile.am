@@ -1,0 +1,10 @@
+if COND_SYSTEM_ZLIB
+else
+MAYBE_ZLIB=zlib
+endif
+
+if COND_FASTJAR
+MAYBE_FASTJAR=fastjar
+endif
+
+SUBDIRS = $(MAYBE_ZLIB) $(MAYBE_FASTJAR)

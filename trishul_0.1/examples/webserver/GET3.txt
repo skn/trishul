@@ -1,0 +1,6 @@
+GET /private/index.html HTTP/1.0
+User-Agent: Wget/1.10.2
+Accept: */*
+Host: trishul:8080
+Connection: Close
+

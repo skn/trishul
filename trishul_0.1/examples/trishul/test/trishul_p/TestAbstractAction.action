@@ -1,0 +1,27 @@
+package trishul.test.trishul_p;
+import trishul_p.*;
+
+public class TestAbstractAction
+extends AbstractAction
+{
+	private int param1;
+	private String param2;
+
+  	public boolean matches (Action a)
+  	{
+    	aswitch(a)
+    	{
+      	case <* trishul.test.trishul_p.TestGeneric.testParams (int a1, java.lang.String a2)>:
+      		param1 = a1;
+      		param2 = a2;
+      		_this = a.getThisPointer ();
+	      	return true;
+      	case <* trishul.test.trishul_p.TestGeneric.testSecond (java.lang.String a2, int a1)>:
+      		param1 = a1;
+      		param2 = a2;
+      		_this = a.getThisPointer ();
+	      	return true;
+    	}
+    	return false;
+  	}
+}

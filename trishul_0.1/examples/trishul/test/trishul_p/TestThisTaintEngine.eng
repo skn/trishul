@@ -1,0 +1,18 @@
+package trishul.test.trishul_p;
+import trishul_p.*;
+
+public class TestThisTaintEngine
+extends Engine
+{
+  	public Order query (Action a)
+  	{
+    	aswitch(a)
+    	{
+      	case <* trishul.test.trishul_p.TestGeneric.<init>()>:
+	      	return new ObjectTaintOrder (a.getThisPointer (), #object:1);
+      	case <* *.*#<1>.test1()>:
+	      	return new SuppressOrder ();
+    	}
+      	return null;
+  	}
+}

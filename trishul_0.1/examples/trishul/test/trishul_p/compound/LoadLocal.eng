@@ -1,0 +1,42 @@
+package trishul.test.trishul_p.compound;
+
+import trishul_p.*;
+import java.io.*;
+
+public class LoadLocal
+extends Engine
+{
+	private EngineHandle localEngineHandle;
+	public Order query (Action a)
+  	{
+  		aswitch (a)
+  		{
+  		case <* *.Test.hook (boolean b)>:
+  			if (b)
+  			{
+  				try
+  				{
+  					File f = new File ("trishul/test/trishul_p/compound/Local.class");
+  					FileInputStream in = new FileInputStream (f);
+  					long size = f.length ();
+
+  					byte[] buffer = new byte[(int) size];
+  					in.read (buffer, 0, buffer.length);
+  					localEngineHandle = addEngine (buffer, getDisallowEnginePolicy ());
+  				}
+  				catch (Exception e)
+  				{
+  					e.printStackTrace ();
+  				}
+			}
+			else
+			{
+				if (localEngineHandle != null)
+					removeEngine (localEngineHandle);
+			}
+  			break;
+  		}
+      	return null;
+    }
+}
+

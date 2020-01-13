@@ -1,0 +1,28 @@
+package trishul.test.trishul_p.compound;
+
+import trishul_p.*;
+
+public class Global
+extends Engine
+{
+	private EngineHandle localEngineHandle;
+
+	public Order query (Action a)
+  	{
+  		aswitch (a)
+  		{
+  		case <* java.io.PrintStream.println (String)>:
+  			return new OKOrder ();
+  		case <* *.Test.hook (boolean b)>:
+  			if (b) localEngineHandle = addEngine (Local.class, getDisallowEnginePolicy ());
+  			else
+  			{
+				if (localEngineHandle != null)
+					removeEngine (localEngineHandle);
+			}
+  			break;
+  		}
+      	return null;
+    }
+}
+

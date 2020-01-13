@@ -1,0 +1,20 @@
+package trishul.test.trishul_p;
+import trishul_p.*;
+
+public class TestAbstractActionEngine
+extends Engine
+{
+  	public Order query (Action a)
+  	{
+    	aswitch(a)
+    	{
+      	case <abstract * trishul.test.trishul_p.TestAbstractAction(int p1, String p2)>:
+	      	System.out.print ("ABSTRACT: " + p1 + " : " + p2 + "\n");
+	      	break;
+	    case done:
+	      	System.out.print ("DONE\n");
+	      	break;
+    	}
+    	return null;
+  	}
+}

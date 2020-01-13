@@ -1,0 +1,6 @@
+666
+NOT ALLOWED
+Orignal string
+trishul_p.SuppressException: Not allowed
+   at trishul.test.trishul_p.TestGeneric.testParams (TestGeneric.java:42)
+   at trishul.test.trishul_p.TestGeneric.main (TestGeneric.java:69)

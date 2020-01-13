@@ -1,0 +1,22 @@
+package trishul.test.trishul_p;
+
+import trishul_p.*;
+
+public class ContextTaint
+extends Engine
+{
+  	public Order query (Action a)
+  	{
+    	aswitch(a)
+    	{
+    	// Test primitive and & /
+      	case <* trishul.test.trishul_p.TestGeneric.passInt(int)>:
+      		return new RetValTaintOrder (#primitive:1);
+		case <String *.*.passString(*)#<1>>:
+      		return new ReplaceOrder("Replaced string");
+      	}
+
+      	return null;
+     }
+}
+
